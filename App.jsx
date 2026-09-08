@@ -3,7 +3,7 @@ import {
   Settings, Gavel, Trophy, Check, Plus, Trash2, RotateCcw, Users,
   Monitor, LogOut, Play, ChevronRight, KeyRound, ShieldCheck, Eye, Flag, Bell, Mic, Pencil
 } from "lucide-react";
-import { store } from "./lib/store";
+import { store } from "./store";
 
 /* ================================================================== *
  *  Console de compétition GAF / GAM — FfG (v4)
