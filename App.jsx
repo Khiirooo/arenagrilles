@@ -388,7 +388,7 @@ function Gate({ config, onEnter, presence }) {
         )}
         {err && <p className="mt-2 text-sm" style={{ color: "var(--late)" }}>{err}</p>}
         {role && <button onClick={submit} className="btn btn-gold w-full mt-4" style={{ justifyContent: "center" }}>{role === "public" ? "Ouvrir l'écran" : "Entrer"}</button>}
-        <p className="faint mt-6" style={{ fontSize: ".7rem" }}>Démo — organisateur ORGA2026 · superviseur SUPER2026 · speaker SPEAK2026 · coach COACH2026. Par agrès (onglet Accès) : juges ex. SAUTF26, Juge Sup. ex. SAUTFJS. Public sans code.</p>
+        <p className="faint mt-6" style={{ fontSize: ".7rem" }}>By Lucas</p>
       </div>
     </div>
   );
