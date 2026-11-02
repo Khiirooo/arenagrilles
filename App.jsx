@@ -294,7 +294,7 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState(navigator.onLine ? "connecting" : "offline");
   const [syncError, setSyncError] = useState("");
   const [retryNonce, setRetryNonce] = useState(0);
-  const tabToken = useRef("tab-" + Math.random().toString(36).slice(2));
+  const tabToken = useRef("tab-" + (globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)));
 
 
   const refreshAll = useCallback(async () => {
@@ -378,7 +378,7 @@ export default function App() {
 
   useEffect(() => {
     if (!session || session.role === "public") return;
-    const token = sessionKey(session) + ":" + tabToken.current;
+    const token = session.claimedToken || (sessionKey(session) + ":" + tabToken.current);
     let active = true;
     const beat = async () => {
       try {
@@ -387,13 +387,24 @@ export default function App() {
         });
         if (active) setPresence(next);
       } catch (error) {
-        // La présence est indicative et ne doit jamais interrompre la saisie des notes.
         console.warn("Présence temporairement indisponible", error);
+        if (active && session.role === "juge" && /réservation.*expirée/i.test(error?.message || "")) {
+          setSyncError("Votre poste de juge n'est plus réservé : reconnectez-vous avant de saisir des notes.");
+          setSession(null);
+        }
       }
     };
     void beat();
     const iv = setInterval(() => void beat(), 12000);
-    return () => { active = false; clearInterval(iv); };
+    return () => {
+      active = false;
+      clearInterval(iv);
+      if (session.role === "juge" && session.claimedToken) {
+        void store.atomic(PRESENCE_KEY, "presence_release", { token }).catch((error) =>
+          console.warn("Libération différée du poste", error)
+        );
+      }
+    };
   }, [session]);
 
   const safeSave = useCallback(async (work) => {
@@ -473,7 +484,7 @@ export default function App() {
   if (!session) return <><style>{STYLE}</style><SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} />{
     !showGate ? <Landing config={config} roster={roster} scores={scores} live={live} lastSync={lastSync} onPublic={(mode) => setSession({ role: "public", mode })} onStaff={() => setShowGate(true)} />
       : !staffOk ? <StaffGate config={config} onOk={() => setStaffOk(true)} onBack={() => setShowGate(false)} />
-        : <Gate config={config} onEnter={setSession} presence={presence} onBack={() => { setStaffOk(false); setShowGate(false); }} />
+        : <Gate config={config} onEnter={setSession} presence={presence} seatToken={tabToken.current} onBack={() => { setStaffOk(false); setShowGate(false); }} />
   }</>;
 
   const apLbl = apparatusOf(session.discipline).find((a) => a.id === session.apparatus)?.label;
@@ -626,16 +637,16 @@ function StaffGate({ config, onOk, onBack }) {
         <p className="faint text-sm" style={{ marginBottom: 12 }}>Réservé au staff (organisateur, juges, coachs, superviseur, speaker). Entrez le mot de passe d'accès.</p>
         <div className="flex items-center gap-2 inp" style={{ padding: "0 .6rem" }}>
           <KeyRound size={16} className="faint" />
-          <input type="password" autoFocus value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="Mot de passe" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
+          <input type="password" autoFocus value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && void submit()} placeholder="Mot de passe" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
         </div>
         {err && <p style={{ color: "var(--late)", fontSize: ".85rem", marginTop: 8 }}>{err}</p>}
-        <button onClick={submit} className="btn btn-gold w-full mt-3" style={{ justifyContent: "center" }}>Accéder</button>
+        <button onClick={() => void submit()} className="btn btn-gold w-full mt-3" style={{ justifyContent: "center" }}>Accéder</button>
       </div>
     </div>
   );
 }
 
-function Gate({ config, onEnter, presence, onBack }) {
+function Gate({ config, onEnter, presence, seatToken, onBack }) {
   const [role, setRole] = useState(null);
   const [code, setCode] = useState("");
   const [discipline, setDiscipline] = useState("GAF");
@@ -644,6 +655,7 @@ function Gate({ config, onEnter, presence, onBack }) {
   const [apparatus, setApparatus] = useState("saut");
   const [club, setClub] = useState("");
   const [err, setErr] = useState("");
+  const [joining, setJoining] = useState(false);
   useEffect(() => { setApparatus(apparatusOf(discipline)[0].id); }, [discipline]);
 
   const liveRoles = [
@@ -663,17 +675,38 @@ function Gate({ config, onEnter, presence, onBack }) {
       <div className="faint" style={{ fontSize: ".72rem" }}>{desc}</div>
     </button>
   );
-  const submit = () => {
+  const submit = async () => {
+    if (joining || !role) return;
     if (role === "public") return onEnter({ role: "public" });
     if (role === "coach" && !club) return setErr("Choisissez votre club.");
     const jkey = `${discipline}:${apparatus}`;
     let expected;
-    if (role === "juge") expected = js ? (config.jsCodes?.[jkey] || config.judgeCodes?.[jkey] || "") : (config.judgeCodes?.[jkey] || "");
-    else if (role === "coach") expected = (config.clubs?.find((c) => c.name === club)?.code) || "";
-    else expected = config.codes[role] || "";
-    if (code.trim().toUpperCase() !== expected.toUpperCase()) return setErr("Code incorrect.");
-    if (role === "juge") { const pk = `juge:${discipline}:${apparatus}:${js ? "JS" : judge}`; const p = presence?.[pk]; if (p && Date.now() - (p.ts || 0) < 30000) return setErr(js ? "Un Juge Supérieur est déjà connecté sur cet agrès." : `Le poste Juge ${judge} est déjà pris sur cet agrès.`); }
-    onEnter({ role, discipline: role === "juge" ? discipline : undefined, judgeType: role === "juge" ? (js ? "js" : "poste") : undefined, judge: role === "juge" ? (js ? "JS" : judge) : undefined, apparatus: role === "juge" ? apparatus : undefined, club: role === "coach" ? club : undefined });
+    if (role === "juge") expected = js ? (config.jsCodes?.[jkey] || "") : (config.judgeCodes?.[jkey] || "");
+    else if (role === "coach") expected = config.clubs?.find((c) => c.name === club)?.code || "";
+    else expected = config.codes?.[role] || "";
+    if (!expected || !code.trim() || code.trim().toUpperCase() !== String(expected).toUpperCase()) {
+      return setErr("Code incorrect ou non configuré.");
+    }
+    const joined = {
+      role, discipline: role === "juge" ? discipline : undefined,
+      judgeType: role === "juge" ? (js ? "js" : "poste") : undefined,
+      judge: role === "juge" ? (js ? "JS" : judge) : undefined,
+      apparatus: role === "juge" ? apparatus : undefined,
+      club: role === "coach" ? club : undefined
+    };
+    if (role !== "juge") return onEnter(joined);
+    const slot = sessionKey(joined);
+    const token = slot + ":" + seatToken;
+    setJoining(true);
+    setErr("");
+    try {
+      await store.atomic(PRESENCE_KEY, "presence_claim", {
+        slot, token, entry: { label: sessionLabel(joined), role: "juge" }
+      });
+      onEnter({ ...joined, claimedToken: token });
+    } catch (error) {
+      setErr(error?.message || "Impossible de réserver ce poste. Vérifiez la connexion.");
+    } finally { setJoining(false); }
   };
 
   return (
@@ -720,11 +753,11 @@ function Gate({ config, onEnter, presence, onBack }) {
         {role && role !== "public" && (
           <div className="flex items-center gap-2 inp" style={{ padding: "0 .6rem" }}>
             <KeyRound size={16} className="faint" />
-            <input value={code} onChange={(e) => { setCode(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="Code d'accès" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
+            <input value={code} onChange={(e) => { setCode(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && void submit()} placeholder="Code d'accès" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
           </div>
         )}
         {err && <p className="mt-2 text-sm" style={{ color: "var(--late)" }}>{err}</p>}
-        {role && <button onClick={submit} className="btn btn-gold w-full mt-4" style={{ justifyContent: "center" }}>{role === "public" ? "Ouvrir l'écran" : "Entrer"}</button>}
+        {role && <button onClick={() => void submit()} className="btn btn-gold w-full mt-4" style={{ justifyContent: "center" }}>{role === "public" ? "Ouvrir l'écran" : "Entrer"}</button>}
         <p className="faint mt-6" style={{ fontSize: ".7rem" }}>Démo — organisateur ORGA2026 · superviseur SUPER2026 · speaker SPEAK2026. Coachs : choisir le club + son code (ex. Tempogym / TEMPO1). Juges par agrès dans l'onglet Accès. Public sans code.</p>
       </div>
     </div>
@@ -1380,14 +1413,14 @@ function CoachRoster({ config, club, mine, addGymnast, removeGymnast, editGymnas
       <h3 className="disp mb-1" style={{ fontWeight: 600 }}>{editId ? "MODIFIER LA GYMNASTE" : "INSCRIRE UNE GYMNASTE"}</h3>
       <p className="faint text-xs mb-3">Rattachée à <b className="gold">{club}</b>. La discipline suit la division choisie.</p>
       <div className="grid sm:grid-cols-2 gap-2 mb-2">
-        <input className="inp" placeholder="Nom" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} onKeyDown={(e) => e.key === "Enter" && submit()} />
+        <input className="inp" placeholder="Nom" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} onKeyDown={(e) => e.key === "Enter" && void submit()} />
         <input className="inp" placeholder="Équipe (optionnel)" value={g.team} onChange={(e) => setG({ ...g, team: e.target.value })} />
         <Sel value={g.division} onChange={(v) => setG({ ...g, division: v })} opts={config.divisions.map((d) => [d.id, `${d.discipline} · ${d.label}`])} pre="Division" />
         <Sel value={g.category} onChange={(v) => setG({ ...g, category: v })} opts={config.categories.map((c) => [c, c])} pre="Catégorie" />
         <Sel value={g.group} onChange={(v) => setG({ ...g, group: v })} opts={config.groups.map((x) => [x, x])} pre="Groupe" />
         <input className="inp num" placeholder="Dossard" value={g.dossard} onChange={(e) => setG({ ...g, dossard: e.target.value })} />
         <div className="flex gap-2 sm:col-span-2">
-          <button onClick={submit} className="btn btn-gold flex-1" style={{ justifyContent: "center" }}><Plus size={15} />{editId ? "Enregistrer" : "Inscrire"}</button>
+          <button onClick={() => void submit()} className="btn btn-gold flex-1" style={{ justifyContent: "center" }}><Plus size={15} />{editId ? "Enregistrer" : "Inscrire"}</button>
           {editId && <button onClick={() => { setEditId(null); setG(blank); }} className="btn">Annuler</button>}
         </div>
       </div>
