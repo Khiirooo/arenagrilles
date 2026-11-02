@@ -4,6 +4,8 @@ import {
   Monitor, LogOut, Play, ChevronRight, KeyRound, ShieldCheck, Eye, Flag, Bell, Mic, Pencil, Share2, Star
 } from "lucide-react";
 import { store } from "./store";
+import { parseNum, isValidNumberInput, checkCell } from "./scoreRules.js";
+import { csvFromRows } from "./csvUtils.js";
 
 /* ================================================================== *
  *  Console de compétition GAF / GAM — FfG (v4)
@@ -158,12 +160,11 @@ const seedRoster = () => ([
 ]);
 
 /* ------------------------------ helpers ------------------------------ */
-const parseNum = (v) => { if (v === "" || v == null) return null; const n = parseFloat(String(v).replace(",", ".")); return isNaN(n) ? null : n; };
 const round2 = (n) => Math.round(n * 100) / 100;
 const fmt = (n) => (n == null ? "—" : round2(n).toFixed(2));
 const fmt3 = (n) => (n == null ? "—" : Number(n).toFixed(3));
 const parseTime = (t) => { const [h, m] = (t || "0:0").split(":").map(Number); return h * 60 + m; };
-const toClock = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(Math.round(m % 60)).padStart(2, "0")}`;
+const toClock = (m) => { const minutes = ((Math.round(Number(m) || 0) % 1440) + 1440) % 1440; return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`; };
 const rotTime = (config, disc, rot) => { const o = config.schedule.times?.[disc]?.[rot]; return (o != null && o !== "") ? parseTime(o) : parseTime(config.schedule.startTime) + rot * config.schedule.durationMin; };
 const combine = (values, rule) => {
   const a = values.filter((v) => v != null && !isNaN(v)).sort((x, y) => x - y);
@@ -185,7 +186,7 @@ const cellTotal = (cell, div) => {
   const bonus = div.bonus ? (cell.bonus || 0) : 0;
   return round2(b + bonus - pen);
 };
-const validatedTotal = (cell, div) => (cell && cell.status === "validated") ? cellTotal(cell, div) : null;
+const validatedTotal = (cell, div) => (cell && cell.status === "validated" && !checkCell(cell, div)) ? cellTotal(cell, div) : null;
 const gymTotal = (scores, div, g) => apparatusOf(div.discipline).reduce((s, a) => s + (validatedTotal(scores?.[g.id]?.[a.id], div) || 0), 0);
 const catsFor = (config, roster, divisionId) => { const s = new Set(roster.filter((g) => g.division === divisionId).map((g) => g.category)); const present = config.categories.filter((c) => s.has(c)); return present.length ? present : config.categories; };
 const matchG = (g, q) => { if (!q) return true; const s = q.toLowerCase(); return g.name.toLowerCase().includes(s) || String(g.dossard || "").includes(s); };
@@ -241,10 +242,50 @@ const STYLE = `
 .flash{animation:flash .9s ease;}
 @keyframes flash{0%{box-shadow:0 0 0 3px var(--gold),0 0 40px #e2ae4688;}100%{box-shadow:none;}}
 @media (prefers-reduced-motion:reduce){.risein,.livedot{animation:none;}}
+@media (max-width: 640px) {
+  .ff { font-size: 14px; }
+  .ff main { padding: 10px !important; }
+  .ff table { display:block; max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .ff button, .ff a.btn { min-height: 40px; }
+  .ff input, .ff select, .ff textarea { font-size: 16px !important; max-width: 100%; }
+  .ff .grid { min-width: 0; }
+  .ff header .max-w-6xl { flex-wrap: wrap; }
+}
 input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.7);}
 `;
 
 /* ============================== APP ============================== */
+
+function SyncBanner({ status, error, retry, dismiss }) {
+  if (status === "live" && !error) return null;
+  const offline = status === "offline";
+  return (
+    <div role="status" aria-live="polite" style={{
+      position: "fixed", bottom: 12, left: 12, right: 12, margin: "auto",
+      maxWidth: 580, zIndex: 1000, padding: "12px 16px", borderRadius: 12,
+      background: "#181d28", border: "1px solid #d1a753", color: "#f8f4ec",
+      boxShadow: "0 8px 28px #0009", fontFamily: "system-ui,sans-serif",
+      display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap"
+    }}>
+      <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+        <strong>{offline ? "Hors connexion" : status === "fallback" ? "Connexion en cours / mode de secours" : "Connexion au serveur"}</strong>
+        <div style={{ fontSize: 12, marginTop: 3 }}>
+          {error || (offline ? "Les nouvelles notes ne sont pas enregistrées tant que le réseau est indisponible." :
+            "Les résultats restent consultables ; actualisation automatique de secours.")}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button type="button" onClick={retry} style={{ padding: "8px 12px", background: "#e0b961", border: 0, borderRadius: 8, fontWeight: 700, cursor: "pointer", color: "#181d28" }}>
+          Actualiser
+        </button>
+        {error && <button type="button" onClick={dismiss} style={{ padding: "8px 10px", background: "transparent", border: "1px solid #9cabbc", color: "white", borderRadius: 8, cursor: "pointer" }}>
+          Alerte lue
+        </button>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [roster, setRoster] = useState([]);
@@ -256,68 +297,217 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [showGate, setShowGate] = useState(false);
   const [staffOk, setStaffOk] = useState(false);
+  const [syncStatus, setSyncStatus] = useState(navigator.onLine ? "connecting" : "offline");
+  const [syncError, setSyncError] = useState("");
+  const failedSave = useRef(false);
+  const dismissError = () => { failedSave.current = false; setSyncError(""); };
+  const [retryNonce, setRetryNonce] = useState(0);
+  const tabToken = useRef("tab-" + (globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)));
 
-  useEffect(() => { (async () => {
-    let c = await store.get(CONFIG_KEY); if (!c || c._v !== CONFIG_VERSION) { c = seedConfig(); await store.set(CONFIG_KEY, c); }
-    let r = await store.get(ROSTER_KEY); if (!r) { r = seedRoster(); await store.set(ROSTER_KEY, r); }
-    setConfig(c); setRoster(r);
-    setScores((await store.get(SCORES_KEY)) || {});
-    setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} });
-    setInquiries((await store.get(INQ_KEY)) || []);
-  })(); }, []);
+
+  const refreshAll = useCallback(async () => {
+    // Les erreurs de lecture ne doivent JAMAIS ressembler à une base vide.
+    const keys = [CONFIG_KEY, ROSTER_KEY, SCORES_KEY, LIVE_KEY, INQ_KEY, PRESENCE_KEY];
+    const [c, r, s, l, i, p] = await Promise.all(keys.map((key) => store.get(key)));
+    if (c) setConfig(c);
+    if (r !== null) setRoster(r);
+    if (s !== null) setScores(s);
+    if (l !== null) setLive(l);
+    if (i !== null) setInquiries(i);
+    if (p !== null) setPresence(p);
+    setLastSync(Date.now());
+  }, []);
 
   useEffect(() => {
-    const iv = setInterval(async () => {
-      setScores((await store.get(SCORES_KEY)) || {});
-      setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} });
-      setRoster((await store.get(ROSTER_KEY)) || []);
-      setInquiries((await store.get(INQ_KEY)) || []);
-      setPresence((await store.get(PRESENCE_KEY)) || {});
-      const c = await store.get(CONFIG_KEY); if (c) setConfig(c);
+    let active = true;
+    const onChanged = (key, value) => {
+      if (!active) return;
+      if (key === CONFIG_KEY) setConfig(value);
+      if (key === ROSTER_KEY) setRoster(value);
+      if (key === SCORES_KEY) setScores(value);
+      if (key === LIVE_KEY) setLive(value);
+      if (key === INQ_KEY) setInquiries(value);
+      if (key === PRESENCE_KEY) setPresence(value);
       setLastSync(Date.now());
-    }, 10000);
-    return () => clearInterval(iv);
-  }, []);
+    };
+    const stopWatching = store.watch(onChanged, (state) => {
+      if (!active) return;
+      setSyncStatus(state === "SUBSCRIBED" ? "live" : (navigator.onLine ? "fallback" : "offline"));
+    });
+    const showError = (error) => {
+      if (!active) return;
+      console.error("Arena Grilles : connexion", error);
+      if (!failedSave.current) setSyncError(error?.message || "Connexion au serveur impossible.");
+      setSyncStatus(navigator.onLine ? "fallback" : "offline");
+    };
+    const boot = async () => {
+      try {
+        // Ne jamais réécrire la configuration d'une compétition déjà paramétrée
+        // parce qu'un autre appareil se connecte avec une nouvelle version.
+        if ((await store.get(CONFIG_KEY)) === null) {
+          await store.initialize(CONFIG_KEY, seedConfig());
+        }
+        if ((await store.get(ROSTER_KEY)) === null) {
+          await store.initialize(ROSTER_KEY, seedRoster());
+        }
+        if ((await store.get(LIVE_KEY)) === null) {
+          await store.initialize(LIVE_KEY, { discipline: "GAF", currentRotation: 0, startedAt: {} });
+        }
+        if (active) {
+          await refreshAll();
+          if (!failedSave.current) setSyncError("");
+        }
+      } catch (error) { showError(error); }
+    };
+    const resyncNow = () => {
+      if (navigator.onLine) void refreshAll().then(() => {
+        if (active && !failedSave.current) setSyncError("");
+      }).catch(showError);
+    };
+    const online = () => {
+      if (active) setSyncStatus("fallback");
+      resyncNow();
+    };
+    const offline = () => { if (active) setSyncStatus("offline"); };
+    const visibility = () => { if (!document.hidden) resyncNow(); };
+    window.addEventListener("online", online);
+    window.addEventListener("offline", offline);
+    document.addEventListener("visibilitychange", visibility);
+    const fallback = setInterval(() => {
+      if (!document.hidden && navigator.onLine) resyncNow();
+    }, 20000);
+    void boot();
+    return () => {
+      active = false;
+      stopWatching();
+      clearInterval(fallback);
+      window.removeEventListener("online", online);
+      window.removeEventListener("offline", offline);
+      document.removeEventListener("visibilitychange", visibility);
+    };
+  }, [refreshAll, retryNonce]);
 
   useEffect(() => {
     if (!session || session.role === "public") return;
-    const key = sessionKey(session); let on = true;
-    const beat = async () => { if (!on) return; const p = (await store.get(PRESENCE_KEY)) || {}; const now = Date.now(); p[key] = { label: sessionLabel(session), role: session.role, ts: now }; Object.keys(p).forEach((k) => { if (now - (p[k]?.ts || 0) > 60000) delete p[k]; }); await store.set(PRESENCE_KEY, p); setPresence(p); };
-    beat(); const iv = setInterval(beat, 8000); return () => { on = false; clearInterval(iv); };
+    const token = session.claimedToken || (sessionKey(session) + ":" + tabToken.current);
+    let active = true;
+    const beat = async () => {
+      try {
+        const next = await store.atomic(PRESENCE_KEY, "presence_beat", {
+          token, entry: { label: sessionLabel(session), role: session.role }
+        });
+        if (active) setPresence(next);
+      } catch (error) {
+        console.warn("Présence temporairement indisponible", error);
+        if (active && session.role === "juge" && /réservation.*expirée/i.test(error?.message || "")) {
+          setSyncError("Votre poste de juge n'est plus réservé : reconnectez-vous avant de saisir des notes.");
+          setSession(null);
+        }
+      }
+    };
+    void beat();
+    const iv = setInterval(() => void beat(), 12000);
+    return () => {
+      active = false;
+      clearInterval(iv);
+      if (session.role === "juge" && session.claimedToken) {
+        void store.atomic(PRESENCE_KEY, "presence_release", { token }).catch((error) =>
+          console.warn("Libération différée du poste", error)
+        );
+      }
+    };
   }, [session]);
 
-  const saveConfig = useCallback(async (c) => { setConfig(c); await store.set(CONFIG_KEY, c); }, []);
-  const saveLive = useCallback(async (l) => { setLive(l); await store.set(LIVE_KEY, l); }, []);
-  const addGymnast = useCallback(async (g) => { const item = { ...g, id: "g" + Date.now() + Math.floor(Math.random() * 1000) }; let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = [...l, item]; await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; if (chk.find((x) => x.id === item.id)) { n = chk; break; } } setRoster(n); }, []);
-  const removeGymnast = useCallback(async (id) => { let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = l.filter((x) => x.id !== id); await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; if (!chk.find((x) => x.id === id)) { n = chk; break; } } setRoster(n); }, []);
-  const editGymnast = useCallback(async (id, patch) => { let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = l.map((x) => (x.id === id ? { ...x, ...patch } : x)); await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; const it = chk.find((x) => x.id === id); if (it && Object.keys(patch).every((k) => it[k] === patch[k])) { n = chk; break; } } setRoster(n); }, []);
-  const replaceRoster = useCallback(async (arr) => { setRoster(arr); await store.set(ROSTER_KEY, arr); }, []);
-  const writeCell = useCallback(async (gid, aid, patch) => {
-    let m;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const l = (await store.get(SCORES_KEY)) || {};
-      m = { ...l, [gid]: { ...(l[gid] || {}) } };
-      const prev = m[gid][aid] || {};
-      m[gid][aid] = { ...prev, ...patch, ts: Date.now(), e: { ...(prev.e || {}), ...(patch.e || {}) }, notes: { ...(prev.notes || {}), ...(patch.notes || {}) } };
-      await store.set(SCORES_KEY, m);
-      const check = (await store.get(SCORES_KEY)) || {}; const c = check[gid]?.[aid] || {};
-      const ok = Object.keys(patch).every((k) => (k === "e" || k === "notes") ? Object.keys(patch[k]).every((s) => c[k]?.[s] === patch[k][s]) : c[k] === patch[k]);
-      if (ok) { m = check; break; }
+  const safeSave = useCallback(async (work) => {
+    try {
+      if (!navigator.onLine) throw new Error("Pas de connexion Internet : modification non enregistrée.");
+      const value = await work();
+      if (!failedSave.current) setSyncError("");
+      return value;
+    } catch (error) {
+      console.error("Arena Grilles : sauvegarde", error);
+      failedSave.current = true;
+      setSyncError((error?.message || "Enregistrement impossible.") +
+        " Opération non enregistrée : revérifiez la valeur et saisissez-la de nouveau. L’actualisation ne renvoie pas la modification.");
+      setSyncStatus(navigator.onLine ? "fallback" : "offline");
+      return null;
     }
-    setScores(m);
   }, []);
-  const addInquiry = useCallback(async (inq) => { const l = (await store.get(INQ_KEY)) || []; const n = [{ ...inq, id: "i" + Date.now(), filedAt: Date.now(), status: "pending" }, ...l]; setInquiries(n); await store.set(INQ_KEY, n); }, []);
-  const updateInquiry = useCallback(async (id, patch) => { const l = (await store.get(INQ_KEY)) || []; const n = l.map((x) => (x.id === id ? { ...x, ...patch } : x)); setInquiries(n); await store.set(INQ_KEY, n); }, []);
-  const deleteCell = useCallback(async (gid, aid) => { const l = (await store.get(SCORES_KEY)) || {}; if (l[gid]) { const m = { ...l, [gid]: { ...l[gid] } }; delete m[gid][aid]; setScores(m); await store.set(SCORES_KEY, m); } }, []);
-  const resync = useCallback(async () => { setScores((await store.get(SCORES_KEY)) || {}); setRoster((await store.get(ROSTER_KEY)) || []); setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} }); setInquiries((await store.get(INQ_KEY)) || []); setPresence((await store.get(PRESENCE_KEY)) || {}); const c = await store.get(CONFIG_KEY); if (c) setConfig(c); }, []);
+
+  const atomicSave = useCallback(async (key, action, payload, apply) => {
+    const next = await safeSave(() => store.atomic(key, action, payload));
+    if (next !== null) {
+      apply(next);
+      setLastSync(Date.now());
+    }
+    return next;
+  }, [safeSave]);
+
+  const saveConfig = useCallback(async (c) => {
+    const saved = await safeSave(() => store.atomic(CONFIG_KEY, "config_cas", { expected: config, value: c }));
+    if (saved !== null) setConfig(saved);
+  }, [safeSave, config]);
+  const saveLive = useCallback(async (l) => {
+    const saved = await safeSave(() => store.atomic(LIVE_KEY, "live_cas", { expected: live, value: l }));
+    if (saved !== null) setLive(saved);
+  }, [safeSave, live]);
+  const addGymnast = useCallback(async (g) => {
+    const item = { ...g, id: "g" + Date.now() + Math.random().toString(36).slice(2) };
+    await atomicSave(ROSTER_KEY, "roster_add", { item }, setRoster);
+  }, [atomicSave]);
+  const removeGymnast = useCallback(async (id) => {
+    await atomicSave(ROSTER_KEY, "roster_delete", { id }, setRoster);
+  }, [atomicSave]);
+  const editGymnast = useCallback(async (id, patch) => {
+    await atomicSave(ROSTER_KEY, "roster_edit", { id, patch }, setRoster);
+  }, [atomicSave]);
+  const replaceRoster = useCallback(async (arr) => {
+    const saved = await safeSave(() => store.atomic(ROSTER_KEY, "roster_replace_cas", {
+      expected: roster, value: arr
+    }));
+    if (saved !== null) setRoster(saved);
+  }, [safeSave, roster]);
+  const writeCell = useCallback(async (gid, aid, patch) => {
+    return atomicSave(SCORES_KEY, "score_patch", { gid, aid, patch }, setScores);
+  }, [atomicSave]);
+  const addInquiry = useCallback(async (inq) => {
+    const item = { ...inq, id: "i" + Date.now() + Math.random().toString(36).slice(2), filedAt: Date.now(), status: "pending" };
+    await atomicSave(INQ_KEY, "inquiry_add", { item }, setInquiries);
+  }, [atomicSave]);
+  const updateInquiry = useCallback(async (id, patch) => {
+    return atomicSave(INQ_KEY, "inquiry_edit", { id, patch }, setInquiries);
+  }, [atomicSave]);
+  const deleteCell = useCallback(async (gid, aid) => {
+    await atomicSave(SCORES_KEY, "score_delete", { gid, aid }, setScores);
+  }, [atomicSave]);
+  const resetScores = useCallback(async () => {
+    const result = await atomicSave(SCORES_KEY, "scores_reset", {}, setScores);
+    return result !== null;
+  }, [atomicSave]);
+  const resetRoster = useCallback(async () => {
+    const result = await atomicSave(ROSTER_KEY, "competition_reset", {}, setRoster);
+    if (result !== null) setScores({});
+    return result !== null;
+  }, [atomicSave]);
+  const resync = useCallback(async () => {
+    try {
+      await refreshAll();
+      if (!failedSave.current) setSyncError("");
+    } catch (error) { setSyncError(error?.message || "Synchronisation impossible."); }
+  }, [refreshAll]);
 
   useEffect(() => { if (config?.eventName) document.title = "Arena Grilles — " + config.eventName; }, [config]);
 
-  if (!config) return <div className="ff appbg" style={{ minHeight: "100vh", padding: 32 }}>Chargement…</div>;
-  if (!session) return <><style>{STYLE}</style>{
+  if (!config) return <div className="ff appbg" style={{ minHeight: "100vh", padding: 32, color: "white" }}>
+    <style>{STYLE}</style>
+    <div>Chargement de la compétition…</div>
+    {syncError && <p role="alert" style={{ marginTop: 14, color: "#ffbd89" }}>{syncError}</p>}
+    <button className="btn btn-gold" style={{ marginTop: 16 }} onClick={() => setRetryNonce((n) => n + 1)}>Réessayer</button>
+  </div>;
+  if (!session) return <><style>{STYLE}</style><SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} dismiss={dismissError} />{
     !showGate ? <Landing config={config} roster={roster} scores={scores} live={live} lastSync={lastSync} onPublic={(mode) => setSession({ role: "public", mode })} onStaff={() => setShowGate(true)} />
       : !staffOk ? <StaffGate config={config} onOk={() => setStaffOk(true)} onBack={() => setShowGate(false)} />
-        : <Gate config={config} onEnter={setSession} presence={presence} onBack={() => { setStaffOk(false); setShowGate(false); }} />
+        : <Gate config={config} onEnter={setSession} presence={presence} seatToken={tabToken.current} onBack={() => { setStaffOk(false); setShowGate(false); }} />
   }</>;
 
   const apLbl = apparatusOf(session.discipline).find((a) => a.id === session.apparatus)?.label;
@@ -326,6 +516,7 @@ export default function App() {
   return (
     <div className="ff appbg grain" style={{ minHeight: "100vh" }}>
       <style>{STYLE}</style>
+      <SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} dismiss={dismissError} />
       <header style={{ borderBottom: "1px solid var(--line)", position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(8px)", background: "#0a0b0dcc" }}>
         <div className="max-w-6xl mx-auto px-4 py-2.5 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -345,7 +536,7 @@ export default function App() {
       {session.role !== "public" && <RotationBanner live={live} config={config} />}
 
       <main className="max-w-6xl mx-auto p-4">
-        {session.role === "organisateur" && <OrganiserApp {...{ config, roster, scores, live, writeCell, saveConfig, saveLive, addGymnast, removeGymnast, editGymnast, replaceRoster, presence, deleteCell, resync, inquiries }} resetScores={async () => { setScores({}); await store.set(SCORES_KEY, {}); }} resetRoster={async () => { setScores({}); setRoster([]); await store.set(SCORES_KEY, {}); await store.set(ROSTER_KEY, []); }} />}
+        {session.role === "organisateur" && <OrganiserApp {...{ config, roster, scores, live, writeCell, saveConfig, saveLive, addGymnast, removeGymnast, editGymnast, replaceRoster, presence, deleteCell, resync, inquiries }} resetScores={resetScores} resetRoster={resetRoster} />}
         {session.role === "juge" && session.judgeType === "js" && <AgresControlView config={config} roster={roster} scores={scores} writeCell={writeCell} discipline={session.discipline} apparatus={session.apparatus} inquiries={inquiries} live={live} />}
         {session.role === "juge" && session.judgeType !== "js" && <JudgeView config={config} roster={roster} scores={scores} writeCell={writeCell} judge={session.judge} discipline={session.discipline} apparatus={session.apparatus} live={live} />}
         {session.role === "superviseur" && <SupervisorApp {...{ config, roster, scores, inquiries, updateInquiry, writeCell }} />}
@@ -459,7 +650,7 @@ function Landing({ config, roster, scores, live, lastSync, onPublic, onStaff }) 
 
 function StaffGate({ config, onOk, onBack }) {
   const [pw, setPw] = useState(""); const [err, setErr] = useState("");
-  const submit = () => { if (pw.trim().toUpperCase() === String(config.staffPassword || "").toUpperCase()) onOk(); else setErr("Mot de passe incorrect."); };
+  const submit = () => { if (pw.trim() && config.staffPassword && pw.trim().toUpperCase() === String(config.staffPassword).toUpperCase()) onOk(); else setErr("Mot de passe incorrect ou non configuré."); };
   return (
     <div className="ff appbg grain" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
       <div className="w-full max-w-sm risein panel p-5">
@@ -469,16 +660,16 @@ function StaffGate({ config, onOk, onBack }) {
         <p className="faint text-sm" style={{ marginBottom: 12 }}>Réservé au staff (organisateur, juges, coachs, superviseur, speaker). Entrez le mot de passe d'accès.</p>
         <div className="flex items-center gap-2 inp" style={{ padding: "0 .6rem" }}>
           <KeyRound size={16} className="faint" />
-          <input type="password" autoFocus value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="Mot de passe" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
+          <input type="password" autoFocus value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && void submit()} placeholder="Mot de passe" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
         </div>
         {err && <p style={{ color: "var(--late)", fontSize: ".85rem", marginTop: 8 }}>{err}</p>}
-        <button onClick={submit} className="btn btn-gold w-full mt-3" style={{ justifyContent: "center" }}>Accéder</button>
+        <button onClick={() => void submit()} className="btn btn-gold w-full mt-3" style={{ justifyContent: "center" }}>Accéder</button>
       </div>
     </div>
   );
 }
 
-function Gate({ config, onEnter, presence, onBack }) {
+function Gate({ config, onEnter, presence, seatToken, onBack }) {
   const [role, setRole] = useState(null);
   const [code, setCode] = useState("");
   const [discipline, setDiscipline] = useState("GAF");
@@ -487,6 +678,7 @@ function Gate({ config, onEnter, presence, onBack }) {
   const [apparatus, setApparatus] = useState("saut");
   const [club, setClub] = useState("");
   const [err, setErr] = useState("");
+  const [joining, setJoining] = useState(false);
   useEffect(() => { setApparatus(apparatusOf(discipline)[0].id); }, [discipline]);
 
   const liveRoles = [
@@ -506,17 +698,38 @@ function Gate({ config, onEnter, presence, onBack }) {
       <div className="faint" style={{ fontSize: ".72rem" }}>{desc}</div>
     </button>
   );
-  const submit = () => {
+  const submit = async () => {
+    if (joining || !role) return;
     if (role === "public") return onEnter({ role: "public" });
     if (role === "coach" && !club) return setErr("Choisissez votre club.");
     const jkey = `${discipline}:${apparatus}`;
     let expected;
-    if (role === "juge") expected = js ? (config.jsCodes?.[jkey] || config.judgeCodes?.[jkey] || "") : (config.judgeCodes?.[jkey] || "");
-    else if (role === "coach") expected = (config.clubs?.find((c) => c.name === club)?.code) || "";
-    else expected = config.codes[role] || "";
-    if (code.trim().toUpperCase() !== expected.toUpperCase()) return setErr("Code incorrect.");
-    if (role === "juge") { const pk = `juge:${discipline}:${apparatus}:${js ? "JS" : judge}`; const p = presence?.[pk]; if (p && Date.now() - (p.ts || 0) < 30000) return setErr(js ? "Un Juge Supérieur est déjà connecté sur cet agrès." : `Le poste Juge ${judge} est déjà pris sur cet agrès.`); }
-    onEnter({ role, discipline: role === "juge" ? discipline : undefined, judgeType: role === "juge" ? (js ? "js" : "poste") : undefined, judge: role === "juge" ? (js ? "JS" : judge) : undefined, apparatus: role === "juge" ? apparatus : undefined, club: role === "coach" ? club : undefined });
+    if (role === "juge") expected = js ? (config.jsCodes?.[jkey] || "") : (config.judgeCodes?.[jkey] || "");
+    else if (role === "coach") expected = config.clubs?.find((c) => c.name === club)?.code || "";
+    else expected = config.codes?.[role] || "";
+    if (!expected || !code.trim() || code.trim().toUpperCase() !== String(expected).toUpperCase()) {
+      return setErr("Code incorrect ou non configuré.");
+    }
+    const joined = {
+      role, discipline: role === "juge" ? discipline : undefined,
+      judgeType: role === "juge" ? (js ? "js" : "poste") : undefined,
+      judge: role === "juge" ? (js ? "JS" : judge) : undefined,
+      apparatus: role === "juge" ? apparatus : undefined,
+      club: role === "coach" ? club : undefined
+    };
+    if (role !== "juge") return onEnter(joined);
+    const slot = sessionKey(joined);
+    const token = slot + ":" + seatToken;
+    setJoining(true);
+    setErr("");
+    try {
+      await store.atomic(PRESENCE_KEY, "presence_claim", {
+        slot, token, entry: { label: sessionLabel(joined), role: "juge" }
+      });
+      onEnter({ ...joined, claimedToken: token });
+    } catch (error) {
+      setErr(error?.message || "Impossible de réserver ce poste. Vérifiez la connexion.");
+    } finally { setJoining(false); }
   };
 
   return (
@@ -563,11 +776,11 @@ function Gate({ config, onEnter, presence, onBack }) {
         {role && role !== "public" && (
           <div className="flex items-center gap-2 inp" style={{ padding: "0 .6rem" }}>
             <KeyRound size={16} className="faint" />
-            <input value={code} onChange={(e) => { setCode(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="Code d'accès" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
+            <input value={code} onChange={(e) => { setCode(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && void submit()} placeholder="Code d'accès" style={{ width: "100%", background: "transparent", border: "none", padding: ".6rem 0", color: "var(--silver)", outline: "none" }} />
           </div>
         )}
         {err && <p className="mt-2 text-sm" style={{ color: "var(--late)" }}>{err}</p>}
-        {role && <button onClick={submit} className="btn btn-gold w-full mt-4" style={{ justifyContent: "center" }}>{role === "public" ? "Ouvrir l'écran" : "Entrer"}</button>}
+        {role && <button onClick={() => void submit()} className="btn btn-gold w-full mt-4" style={{ justifyContent: "center" }}>{role === "public" ? "Ouvrir l'écran" : "Entrer"}</button>}
         <p className="faint mt-6" style={{ fontSize: ".7rem" }}>Démo — organisateur ORGA2026 · superviseur SUPER2026 · speaker SPEAK2026. Coachs : choisir le club + son code (ex. Tempogym / TEMPO1). Juges par agrès dans l'onglet Accès. Public sans code.</p>
       </div>
     </div>
@@ -710,7 +923,8 @@ function LiveControl({ config, live, saveLive, saveConfig, roster, scores, write
   const pct = tot ? Math.round(val / tot * 100) : 0;
   const shiftMin = (min) => { const t = { ...(config.schedule.times || {}) }; if (t[disc]) { const nd = {}; Object.entries(t[disc]).forEach(([k, v]) => { nd[k] = toClock(Math.max(0, parseTime(v) + min)); }); t[disc] = nd; } saveConfig({ ...config, schedule: { ...config.schedule, startTime: toClock(Math.max(0, parseTime(config.schedule.startTime) + min)), times: t } }); };
   const recalerNow = () => { const dd = nowMin - rotTime(config, disc, r); const t = { ...(config.schedule.times || {}) }; const nd = { ...(t[disc] || {}) }; for (let k = r; k < aps.length; k++) nd[k] = toClock(Math.max(0, rotTime(config, disc, k) + dd)); t[disc] = nd; saveConfig({ ...config, schedule: { ...config.schedule, times: t } }); saveLive({ ...live, startedAt: { ...live.startedAt, [r]: Date.now() } }); };
-  const passerSuite = () => { roster.forEach((g) => { const d = config.divisions.find((x) => x.id === g.division); if (!d || d.discipline !== disc) return; aps.forEach((a) => { const c = scores?.[g.id]?.[a.id]; if (c?.status === "submitted" && !(d.mode === "DE" && c.d == null)) writeCell(g.id, a.id, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, disc, g.group, a.id) }); }); }); if (r < last) saveLive({ ...live, currentRotation: r + 1, startedAt: { ...live.startedAt, [r + 1]: Date.now() } }); };
+  // Passer à la rotation suivante ne doit PAS publier automatiquement des notes non vérifiées par le juge supérieur.
+  const passerSuite = () => { if (r < last) return saveLive({ ...live, currentRotation: r + 1, startedAt: { ...live.startedAt, [r + 1]: Date.now() } }); };
   const Sec = ({ title, right, children, gold }) => (<section className="panel p-4"><div className="flex items-center justify-between mb-3 flex-wrap gap-2"><h3 className={`disp ${gold ? "gold" : ""}`} style={{ fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", fontSize: ".95rem" }}>{title}</h3>{right}</div>{children}</section>);
 
   return (
@@ -880,7 +1094,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
   useEffect(() => { const list = config.divisions.filter((d) => d.discipline === disc); if (!list.find((d) => d.id === division)) setDivision(list[0]?.id); if (!locked) setAp(apparatusOf(disc)[0].id); }, [disc]);
   const div = config.divisions.find((d) => d.id === division);
   const maxJudges = div?.judges || 3;
-  useEffect(() => { if (jn > maxJudges) setJn(1); }, [maxJudges]);
+  useEffect(() => { if (organiser && jn > maxJudges) setJn(1); }, [maxJudges, organiser]);
   const apLabel = apparatusOf(disc).find((a) => a.id === ap)?.label;
   const outOfPanel = !organiser && !!div && jn > div.judges;
   const frozen = !!config.frozen;
@@ -889,6 +1103,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
   useEffect(() => { if (locked && curGroup) setGroupF(curGroup); }, [rot, disc, ap]);
   const list = roster.filter((g) => g.division === division && (category === "" || g.category === category) && (groupF === "" || g.group === groupF) && matchG(g, q)).sort(bibSort);
   const [pmode, setPmode] = useState("liste");
+  const [savingSubmit, setSavingSubmit] = useState(false);
   const [pmIdx, setPmIdx] = useState(0);
   useEffect(() => { setPmIdx(0); }, [division, category, groupF, ap, disc]);
   const seg = (val, set, opts) => <div className="flex flex-wrap gap-1">{opts.map((o) => <button key={o.v} onClick={() => set(o.v)} className={`seg ${val === o.v ? "seg-on" : ""}`}>{o.l}</button>)}</div>;
@@ -954,7 +1169,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
             {err && jn === 1 && !locked && <div style={{ color: "var(--late)", textAlign: "center", marginTop: 10 }}>{err}</div>}
             <div className="flex items-center justify-between mt-5 gap-2 flex-wrap">
               <button onClick={() => go(-1)} disabled={pmIdx <= 0} className="btn">← Précédent</button>
-              {jn === 1 && !locked && <button onClick={() => { writeCell(g.id, ap, { status: "submitted", submittedAt: Date.now() }); go(1); }} disabled={total == null || !!err} className="btn btn-gold" style={{ fontSize: "1.05rem", padding: ".9rem 1.4rem" }}><Check size={18} />Soumettre & suivant →</button>}
+              {jn === 1 && !locked && <button onClick={async () => { setSavingSubmit(true); try { const saved = await writeCell(g.id, ap, { status: "submitted", submittedAt: Date.now() }); if (saved !== null) go(1); } finally { setSavingSubmit(false); } }} disabled={savingSubmit || total == null || !!err} className="btn btn-gold" style={{ fontSize: "1.05rem", padding: ".9rem 1.4rem" }}><Check size={18} />Soumettre & suivant →</button>}
               <button onClick={() => go(1)} disabled={pmIdx >= list.length - 1} className="btn">Suivant →</button>
             </div>
           </div>
@@ -1007,22 +1222,47 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
 function BigNum({ label, value, onCommit, disabled }) {
   const [v, setV] = useState(value ?? ""); const focused = useRef(false);
   useEffect(() => { if (!focused.current) setV(value ?? ""); }, [value]);
-  const commit = () => { if (disabled) return; onCommit(parseNum(v)); };
+  const [invalid, setInvalid] = useState(false);
+  const commit = () => { if (disabled) return; if (!isValidNumberInput(v)) { setInvalid(true); return; } setInvalid(false); void onCommit(parseNum(v)); };
   return (
     <label style={{ textAlign: "center" }}>
-      <div className="lbl" style={{ marginBottom: 4 }}>{label}</div>
-      <input inputMode="decimal" disabled={disabled} value={v} onFocus={() => { focused.current = true; }} onChange={(e) => setV(e.target.value)} onBlur={() => { focused.current = false; commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" className="inp num text-center" style={{ width: 110, fontSize: "2rem", fontWeight: 800, padding: ".5rem", opacity: disabled ? .5 : 1 }} />
+      <div className="lbl" style={{ marginBottom: 4, color: invalid ? "var(--late)" : undefined }}>{label}{invalid ? " (nombre invalide)" : ""}</div>
+      <input inputMode="decimal" disabled={disabled} value={v} onFocus={() => { focused.current = true; }} onChange={(e) => { setV(e.target.value); setInvalid(false); }} onBlur={() => { focused.current = false; commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" className="inp num text-center" style={{ width: 110, fontSize: "2rem", fontWeight: 800, padding: ".5rem", opacity: disabled ? .5 : 1 }} />
     </label>
   );
 }
 function NumInput({ label, value, onCommit, w = 56, disabled }) {
-  const [local, setLocal] = useState(value ?? ""); const [saved, setSaved] = useState(false);
-  useEffect(() => { setLocal(value ?? ""); }, [value]);
-  const commit = () => { if (disabled) return; onCommit(parseNum(local)); setSaved(true); setTimeout(() => setSaved(false), 1200); };
+  const [local, setLocal] = useState(value ?? "");
+  const [saved, setSaved] = useState(false);
+  const [invalid, setInvalid] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const focused = useRef(false);
+  useEffect(() => { if (!focused.current) setLocal(value ?? ""); }, [value]);
+  const commit = async () => {
+    if (disabled || saving) return;
+    if (!isValidNumberInput(local)) { setInvalid(true); return; }
+    setInvalid(false);
+    setFailed(false);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const result = await onCommit(parseNum(local));
+      if (result !== null && result !== false) {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1200);
+      } else {
+        setFailed(true);
+      }
+    } catch (error) {
+      console.error("Saisie non enregistrée", error);
+      setFailed(true);
+    } finally { setSaving(false); }
+  };
   return (
     <label className="block text-center">
-      <span className="lbl flex items-center justify-center gap-0.5">{label}{saved && <Check size={9} className="gold" />}</span>
-      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onChange={(e) => setLocal(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
+      <span className="lbl flex items-center justify-center gap-0.5" style={invalid || failed ? { color: "var(--late)" } : undefined}>{label}{saving ? " …" : failed ? " · NON SAUVÉ" : saved ? <Check size={9} className="gold" /> : null}</span>
+      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onFocus={() => { focused.current = true; }} onChange={(e) => { setLocal(e.target.value); setInvalid(false); setFailed(false); }} onBlur={() => { focused.current = false; void commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
     </label>
   );
 }
@@ -1041,18 +1281,6 @@ function StatusPill({ status }) {
   if (status === "submitted") return <span className="disp" style={{ color: "var(--early)", fontWeight: 600, fontSize: ".8rem" }}>● En attente JS</span>;
   return <span className="disp" style={{ color: "var(--draft)", fontWeight: 600, fontSize: ".8rem" }}>● Brouillon</span>;
 }
-function checkCell(cell, div) {
-  if (!div) return null;
-  const max = div.start || 10;
-  if (div.mode === "DE") {
-    if (cell.d == null) return "Note D manquante";
-    if (cell.d < 0) return "D négatif";
-    if (Object.values(cell.e || {}).some((v) => v < 0 || v > max)) return `E hors 0–${max}`;
-  } else if (Object.values(cell.notes || {}).some((v) => v < 0 || v > max)) return `Note hors 0–${max}`;
-  if ((cell.pen || 0) < 0 || (cell.pen || 0) > 5) return "Pénalité suspecte";
-  return null;
-}
-
 /* -------------------- Juge Supérieur (contrôle agrès) ------------- */
 function AgresControlView({ config, roster, scores, writeCell, discipline, apparatus, inquiries, live }) {
   const apLabel = apparatusOf(discipline).find((a) => a.id === apparatus)?.label;
@@ -1069,14 +1297,28 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
   const sorted = [...list].sort((a, b) => ((rank[scores?.[a.id]?.[apparatus]?.status] ?? 1) - (rank[scores?.[b.id]?.[apparatus]?.status] ?? 1)) || bibSort(a, b));
   const queueList = list.filter((g) => scores?.[g.id]?.[apparatus]?.status === "submitted");
   const queue = queueList.length;
-  const validateAllConform = () => { queueList.forEach((g) => { const c = scores?.[g.id]?.[apparatus] || {}; if (!(div && div.mode === "DE" && c.d == null)) writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) }); }); };
+  const conformList = queueList.filter((g) => !checkCell(scores?.[g.id]?.[apparatus], div));
+  const [validating, setValidating] = useState(false);
+  const validateAllConform = async () => {
+    if (config.frozen || validating) return;
+    setValidating(true);
+    try {
+      for (const g of conformList) {
+        const saved = await writeCell(g.id, apparatus, {
+          status: "validated", validatedAt: Date.now(),
+          tour: tourFor(config, discipline, g.group, apparatus)
+        });
+        if (saved === null) break;
+      }
+    } finally { setValidating(false); }
+  };
   return (
     <div className="space-y-4 risein">
       <div className="panel p-4 flex items-center justify-between flex-wrap gap-2">
         <div><div className="lbl">Juge Supérieur — {discipline}</div><div className="disp gold" style={{ fontSize: "1.8rem", fontWeight: 700, lineHeight: 1 }}>{apLabel}</div></div>
         <div className="flex items-center gap-3">
           <div className="text-right"><div className="lbl">À valider</div><div className="disp num" style={{ fontSize: "1.8rem", fontWeight: 700, color: queue ? "var(--early)" : "var(--dim)" }}>{queue}</div></div>
-          {queue > 0 && <button onClick={validateAllConform} className="btn btn-gold"><Check size={14} />Tout valider ({queue})</button>}
+          {conformList.length > 0 && <button onClick={validateAllConform} disabled={!!config.frozen || validating} className="btn btn-gold"><Check size={14} />Valider notes complètes ({conformList.length})</button>}
         </div>
       </div>
       <div className="panel p-4 grid sm:grid-cols-4 gap-3">
@@ -1089,7 +1331,7 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
         {sorted.length === 0 && <div className="p-6 text-center faint text-sm">Aucune gymnaste.</div>}
         {sorted.map((g) => {
           const cell = scores?.[g.id]?.[apparatus] || {}; const total = cellTotal(cell, div); const st = cell.status;
-          const dMissing = div && div.mode === "DE" && cell.d == null;
+          const scoreProblem = checkCell(cell, div);
           return (
             <div key={g.id} className="p-3 flex items-center gap-3 flex-wrap" style={{ borderTop: "1px solid var(--line)", background: st === "validated" ? "#3fae6a10" : st === "submitted" ? "#6aa2cc14" : "transparent" }}>
               <div className="flex-1 min-w-0">
@@ -1104,10 +1346,10 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
                 <div style={{ width: 62, textAlign: "right" }}><div className="lbl">Total</div><div className="disp num gold" style={{ fontWeight: 700, fontSize: "1.05rem" }}>{fmt(total)}</div></div>
               </div>
               <div className="flex items-center gap-2 justify-end" style={{ flexBasis: "100%" }}>
-                {dMissing && st !== "validated" && <span style={{ color: "var(--late)", fontSize: ".72rem" }}>Note D manquante — saisissez-la avant de valider</span>}
+                {scoreProblem && st !== "validated" && <span style={{ color: "var(--late)", fontSize: ".72rem" }}>{scoreProblem}</span>}
                 <StatusPill status={st} />
                 {st !== "validated"
-                  ? <button onClick={() => writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) })} disabled={total == null || dMissing || !!config.frozen} className="btn btn-gold"><Check size={14} />Valider (live)</button>
+                  ? <button onClick={() => writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) })} disabled={total == null || !!scoreProblem || !!config.frozen} className="btn btn-gold"><Check size={14} />Valider (live)</button>
                   : <button onClick={() => writeCell(g.id, apparatus, { status: "submitted" })} className="btn" style={{ fontSize: ".75rem" }}>Rouvrir</button>}
                 {st === "submitted" && <button onClick={() => writeCell(g.id, apparatus, { status: "draft" })} className="btn" style={{ color: "var(--late)", fontSize: ".75rem" }}>Renvoyer au juge</button>}
               </div>
@@ -1201,14 +1443,14 @@ function CoachRoster({ config, club, mine, addGymnast, removeGymnast, editGymnas
       <h3 className="disp mb-1" style={{ fontWeight: 600 }}>{editId ? "MODIFIER LA GYMNASTE" : "INSCRIRE UNE GYMNASTE"}</h3>
       <p className="faint text-xs mb-3">Rattachée à <b className="gold">{club}</b>. La discipline suit la division choisie.</p>
       <div className="grid sm:grid-cols-2 gap-2 mb-2">
-        <input className="inp" placeholder="Nom" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} onKeyDown={(e) => e.key === "Enter" && submit()} />
+        <input className="inp" placeholder="Nom" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} onKeyDown={(e) => e.key === "Enter" && void submit()} />
         <input className="inp" placeholder="Équipe (optionnel)" value={g.team} onChange={(e) => setG({ ...g, team: e.target.value })} />
         <Sel value={g.division} onChange={(v) => setG({ ...g, division: v })} opts={config.divisions.map((d) => [d.id, `${d.discipline} · ${d.label}`])} pre="Division" />
         <Sel value={g.category} onChange={(v) => setG({ ...g, category: v })} opts={config.categories.map((c) => [c, c])} pre="Catégorie" />
         <Sel value={g.group} onChange={(v) => setG({ ...g, group: v })} opts={config.groups.map((x) => [x, x])} pre="Groupe" />
         <input className="inp num" placeholder="Dossard" value={g.dossard} onChange={(e) => setG({ ...g, dossard: e.target.value })} />
         <div className="flex gap-2 sm:col-span-2">
-          <button onClick={submit} className="btn btn-gold flex-1" style={{ justifyContent: "center" }}><Plus size={15} />{editId ? "Enregistrer" : "Inscrire"}</button>
+          <button onClick={() => void submit()} className="btn btn-gold flex-1" style={{ justifyContent: "center" }}><Plus size={15} />{editId ? "Enregistrer" : "Inscrire"}</button>
           {editId && <button onClick={() => { setEditId(null); setG(blank); }} className="btn">Annuler</button>}
         </div>
       </div>
@@ -1338,24 +1580,84 @@ function SupervisorApp({ config, roster, scores, inquiries, updateInquiry, write
   const [log, setLog] = useState([]); const [chat, setChat] = useState([]);
   const [incDisc, setIncDisc] = useState("GAF");
   const [msg, setMsg] = useState("");
+  const [supervisorError, setSupervisorError] = useState("");
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(iv); }, []);
-  useEffect(() => { let on = true; const load = async () => { if (!on) return; setLog((await store.get(LOG_KEY)) || []); setChat((await store.get(CHAT_KEY)) || []); }; load(); const iv = setInterval(load, 10000); return () => { on = false; clearInterval(iv); }; }, []);
-  const addLog = async (text) => { const l = (await store.get(LOG_KEY)) || []; const n = [{ ts: Date.now(), text }, ...l].slice(0, 100); setLog(n); await store.set(LOG_KEY, n); };
-  const addChat = async (text) => { const l = (await store.get(CHAT_KEY)) || []; const n = [...l, { ts: Date.now(), author: "Superviseur", text }].slice(-100); setChat(n); await store.set(CHAT_KEY, n); };
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const [l, c] = await Promise.all([store.get(LOG_KEY), store.get(CHAT_KEY)]);
+        if (active) { setLog(l || []); setChat(c || []); }
+      } catch (error) {
+        if (active) setSupervisorError(error?.message || "Journal indisponible");
+      }
+    };
+    const stop = store.watch((key, value) => {
+      if (!active) return;
+      if (key === LOG_KEY) setLog(value || []);
+      if (key === CHAT_KEY) setChat(value || []);
+    });
+    void load();
+    const iv = setInterval(() => { if (!document.hidden && navigator.onLine) void load(); }, 20000);
+    return () => { active = false; clearInterval(iv); stop(); };
+  }, []);
+  const addLog = async (text) => {
+    try {
+      const next = await store.atomic(LOG_KEY, "log_add", {
+        item: { id: globalThis.crypto?.randomUUID?.() || Date.now().toString(36), author: "Superviseur", text }
+      });
+      setLog(next); setSupervisorError("");
+      return true;
+    } catch (error) {
+      setSupervisorError(error?.message || "Journal non enregistré");
+      return false;
+    }
+  };
+  const addChat = async (text) => {
+    try {
+      const next = await store.atomic(CHAT_KEY, "chat_add", {
+        item: { id: globalThis.crypto?.randomUUID?.() || Date.now().toString(36), author: "Superviseur", text }
+      });
+      setChat(next); setSupervisorError("");
+      return true;
+    } catch (error) {
+      setSupervisorError(error?.message || "Message non envoyé");
+      return false;
+    }
+  };
+  const sendMessage = async () => {
+    const value = msg.trim();
+    if (!value) return;
+    if (await addChat(value)) setMsg("");
+  };
 
   const pending = inquiries.filter((i) => i.status === "pending");
   const resolved = inquiries.filter((i) => i.status !== "pending");
   const divOf = (id) => config.divisions.find((d) => d.id === id);
-  const accept = (inq, newD) => { if (newD != null) writeCell(inq.gymnastId, inq.apparatus, { d: newD }); updateInquiry(inq.id, { status: "accepted", newD: newD ?? null, decidedAt: Date.now() }); addLog(`Réclamation acceptée · ${inq.gymnastName} · ${inq.apparatusLabel}${newD != null ? ` · D→${fmt(newD)}` : ""}`); };
-  const reject = (inq) => { updateInquiry(inq.id, { status: "rejected", decidedAt: Date.now() }); addLog(`Réclamation rejetée · ${inq.gymnastName} · ${inq.apparatusLabel}`); };
+  const accept = async (inq, newD) => {
+    if (newD != null) {
+      if (!Number.isFinite(newD) || newD < 0) { setSupervisorError("Nouvelle note D invalide."); return; }
+      if ((await writeCell(inq.gymnastId, inq.apparatus, { d: newD })) === null) return;
+    }
+    if ((await updateInquiry(inq.id, { status: "accepted", newD: newD ?? null, decidedAt: Date.now() })) !== null)
+      await addLog(`Réclamation acceptée · ${inq.gymnastName} · ${inq.apparatusLabel}${newD != null ? ` · D→${fmt(newD)}` : ""}`);
+  };
+  const reject = async (inq) => {
+    if ((await updateInquiry(inq.id, { status: "rejected", decidedAt: Date.now() })) !== null)
+      await addLog(`Réclamation rejetée · ${inq.gymnastName} · ${inq.apparatusLabel}`);
+  };
 
   const validatedCells = [];
   roster.forEach((g) => { const d = divOf(g.division); if (!d || d.discipline !== incDisc) return; apparatusOf(d.discipline).forEach((a) => { const cell = scores?.[g.id]?.[a.id]; if (cell?.status === "validated") validatedCells.push({ g, d, a, total: cellTotal(cell, d) }); }); });
-  const unlock = (g, d, a) => { writeCell(g.id, a.id, { status: "draft" }); addLog(`Déverrouillage · ${g.name} · ${d.discipline} ${d.label} · ${a.label}`); };
+  const unlock = async (g, d, a) => {
+    if ((await writeCell(g.id, a.id, { status: "draft" })) !== null)
+      await addLog(`Déverrouillage · ${g.name} · ${d.discipline} ${d.label} · ${a.label}`);
+  };
   const hhmm = (ts) => new Date(ts).toLocaleTimeString("fr-BE", { hour: "2-digit", minute: "2-digit" });
 
   return (
     <div className="space-y-4 risein">
+      {supervisorError && <div role="alert" className="panel p-3" style={{ color: "var(--late)" }}>{supervisorError}</div>}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="flex gap-1">
           <button onClick={() => setTab("rec")} className={`seg ${tab === "rec" ? "seg-gold" : ""}`}>Réclamations{pending.length > 0 ? ` (${pending.length})` : ""}</button>
@@ -1416,8 +1718,8 @@ function SupervisorApp({ config, roster, scores, inquiries, updateInquiry, write
             {chat.map((m, i) => <div key={i} className="panel2 p-2 text-sm"><span className="gold disp" style={{ fontWeight: 600 }}>{m.author}</span> <span className="faint num text-xs">{hhmm(m.ts)}</span><div className="dim">{m.text}</div></div>)}
           </div>
           <div className="flex gap-2">
-            <input className="inp flex-1" placeholder="Message rapide…" value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && msg.trim()) { addChat(msg.trim()); setMsg(""); } }} />
-            <button onClick={() => { if (msg.trim()) { addChat(msg.trim()); setMsg(""); } }} className="btn btn-gold">Envoyer</button>
+            <input className="inp flex-1" placeholder="Message rapide…" value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void sendMessage(); }} />
+            <button onClick={() => void sendMessage()} className="btn btn-gold">Envoyer</button>
           </div>
         </div>
       )}
@@ -1832,7 +2134,8 @@ function RankingsView({ config, roster, scores }) {
   const teams = {}; group.forEach((g) => { if (g.team) (teams[g.team] ||= []).push(g); });
   const teamRows = div ? Object.entries(teams).map(([team, m2]) => { let total = 0; aps.forEach((a) => { const vs = m2.map((m) => validatedTotal(scores?.[m.id]?.[a.id], div)).filter((v) => v != null).sort((x, y) => y - x); total += vs.slice(0, config.teamBestN).reduce((s, v) => s + v, 0); }); return { team, total: round2(total), n: m2.length }; }).sort((a, b) => (b.total - a.total) || a.team.localeCompare(b.team)) : [];
   const [showCsv, setShowCsv] = useState(false);
-  const csv = (() => { const esc = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`; let R = []; if (view === "cg") { R.push(["Rang", "Gymnaste", "Club", ...aps.map((a) => a.label), "Total"]); cg.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, ...x.per.map((p) => fmt(p)), fmt(x.total)])); } else if (view === "agres") { R.push(["Rang", "Gymnaste", "Club", aps.find((a) => a.id === ap)?.label || ""]); byAp.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, fmt(x.s)])); } else { R.push(["Rang", "Équipe", "Gymnastes", "Total"]); teamRows.forEach((x, i) => R.push([i + 1, x.team, x.n, fmt(x.total)])); } return R.map((r) => r.map(esc).join(",")).join("\n"); })();
+  const csv = (() => { const R = []; if (view === "cg") { R.push(["Rang", "Gymnaste", "Club", ...aps.map((a) => a.label), "Total"]); cg.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, ...x.per.map((p) => fmt(p)), fmt(x.total)])); } else if (view === "agres") { R.push(["Rang", "Gymnaste", "Club", aps.find((a) => a.id === ap)?.label || ""]); byAp.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, fmt(x.s)])); } else { R.push(["Rang", "Équipe", "Gymnastes", "Total"]); teamRows.forEach((x, i) => R.push([i + 1, x.team, x.n, fmt(x.total)])); } return csvFromRows(R); })();
+  const downloadCsv = () => { const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `arena-grilles-${discipline}-${division || "tous"}-${view}.csv`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1500); };
 
   return (
     <div className="space-y-4 risein">
@@ -1845,7 +2148,7 @@ function RankingsView({ config, roster, scores }) {
         </div>
         {view === "agres" && <Field label="Agrès">{seg(ap, setAp, aps.map((a) => ({ v: a.id, l: a.label })))}</Field>}
         <div className="flex gap-2 pt-1">
-          <button onClick={() => setShowCsv((v) => !v)} className="btn" style={{ fontSize: ".78rem" }}>Exporter (CSV)</button>
+          <button onClick={downloadCsv} className="btn" style={{ fontSize: ".78rem" }}>Télécharger CSV</button><button onClick={() => setShowCsv((v) => !v)} className="btn" style={{ fontSize: ".78rem" }}>Copier CSV</button>
           <button onClick={() => { try { window.print(); } catch (e) {} }} className="btn" style={{ fontSize: ".78rem" }}>Imprimer</button>
         </div>
         {showCsv && <textarea readOnly className="inp w-full num" rows={6} value={csv} onFocus={(e) => e.target.select()} style={{ fontSize: ".72rem", resize: "vertical" }} />}
