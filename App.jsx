@@ -461,10 +461,19 @@ export default function App() {
     await atomicSave(INQ_KEY, "inquiry_add", { item }, setInquiries);
   }, [atomicSave]);
   const updateInquiry = useCallback(async (id, patch) => {
-    await atomicSave(INQ_KEY, "inquiry_edit", { id, patch }, setInquiries);
+    return atomicSave(INQ_KEY, "inquiry_edit", { id, patch }, setInquiries);
   }, [atomicSave]);
   const deleteCell = useCallback(async (gid, aid) => {
     await atomicSave(SCORES_KEY, "score_delete", { gid, aid }, setScores);
+  }, [atomicSave]);
+  const resetScores = useCallback(async () => {
+    const result = await atomicSave(SCORES_KEY, "scores_reset", {}, setScores);
+    return result !== null;
+  }, [atomicSave]);
+  const resetRoster = useCallback(async () => {
+    const result = await atomicSave(ROSTER_KEY, "competition_reset", {}, setRoster);
+    if (result !== null) setScores({});
+    return result !== null;
   }, [atomicSave]);
   const resync = useCallback(async () => {
     try {
@@ -513,7 +522,7 @@ export default function App() {
       {session.role !== "public" && <RotationBanner live={live} config={config} />}
 
       <main className="max-w-6xl mx-auto p-4">
-        {session.role === "organisateur" && <OrganiserApp {...{ config, roster, scores, live, writeCell, saveConfig, saveLive, addGymnast, removeGymnast, editGymnast, replaceRoster, presence, deleteCell, resync, inquiries }} resetScores={async () => { setScores({}); await store.set(SCORES_KEY, {}); }} resetRoster={async () => { setScores({}); setRoster([]); await store.set(SCORES_KEY, {}); await store.set(ROSTER_KEY, []); }} />}
+        {session.role === "organisateur" && <OrganiserApp {...{ config, roster, scores, live, writeCell, saveConfig, saveLive, addGymnast, removeGymnast, editGymnast, replaceRoster, presence, deleteCell, resync, inquiries }} resetScores={resetScores} resetRoster={resetRoster} />}
         {session.role === "juge" && session.judgeType === "js" && <AgresControlView config={config} roster={roster} scores={scores} writeCell={writeCell} discipline={session.discipline} apparatus={session.apparatus} inquiries={inquiries} live={live} />}
         {session.role === "juge" && session.judgeType !== "js" && <JudgeView config={config} roster={roster} scores={scores} writeCell={writeCell} judge={session.judge} discipline={session.discipline} apparatus={session.apparatus} live={live} />}
         {session.role === "superviseur" && <SupervisorApp {...{ config, roster, scores, inquiries, updateInquiry, writeCell }} />}
@@ -1550,24 +1559,84 @@ function SupervisorApp({ config, roster, scores, inquiries, updateInquiry, write
   const [log, setLog] = useState([]); const [chat, setChat] = useState([]);
   const [incDisc, setIncDisc] = useState("GAF");
   const [msg, setMsg] = useState("");
+  const [supervisorError, setSupervisorError] = useState("");
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(iv); }, []);
-  useEffect(() => { let on = true; const load = async () => { if (!on) return; setLog((await store.get(LOG_KEY)) || []); setChat((await store.get(CHAT_KEY)) || []); }; load(); const iv = setInterval(load, 10000); return () => { on = false; clearInterval(iv); }; }, []);
-  const addLog = async (text) => { const l = (await store.get(LOG_KEY)) || []; const n = [{ ts: Date.now(), text }, ...l].slice(0, 100); setLog(n); await store.set(LOG_KEY, n); };
-  const addChat = async (text) => { const l = (await store.get(CHAT_KEY)) || []; const n = [...l, { ts: Date.now(), author: "Superviseur", text }].slice(-100); setChat(n); await store.set(CHAT_KEY, n); };
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const [l, c] = await Promise.all([store.get(LOG_KEY), store.get(CHAT_KEY)]);
+        if (active) { setLog(l || []); setChat(c || []); }
+      } catch (error) {
+        if (active) setSupervisorError(error?.message || "Journal indisponible");
+      }
+    };
+    const stop = store.watch((key, value) => {
+      if (!active) return;
+      if (key === LOG_KEY) setLog(value || []);
+      if (key === CHAT_KEY) setChat(value || []);
+    });
+    void load();
+    const iv = setInterval(() => { if (!document.hidden && navigator.onLine) void load(); }, 20000);
+    return () => { active = false; clearInterval(iv); stop(); };
+  }, []);
+  const addLog = async (text) => {
+    try {
+      const next = await store.atomic(LOG_KEY, "log_add", {
+        item: { id: globalThis.crypto?.randomUUID?.() || Date.now().toString(36), author: "Superviseur", text }
+      });
+      setLog(next); setSupervisorError("");
+      return true;
+    } catch (error) {
+      setSupervisorError(error?.message || "Journal non enregistré");
+      return false;
+    }
+  };
+  const addChat = async (text) => {
+    try {
+      const next = await store.atomic(CHAT_KEY, "chat_add", {
+        item: { id: globalThis.crypto?.randomUUID?.() || Date.now().toString(36), author: "Superviseur", text }
+      });
+      setChat(next); setSupervisorError("");
+      return true;
+    } catch (error) {
+      setSupervisorError(error?.message || "Message non envoyé");
+      return false;
+    }
+  };
+  const sendMessage = async () => {
+    const value = msg.trim();
+    if (!value) return;
+    if (await addChat(value)) setMsg("");
+  };
 
   const pending = inquiries.filter((i) => i.status === "pending");
   const resolved = inquiries.filter((i) => i.status !== "pending");
   const divOf = (id) => config.divisions.find((d) => d.id === id);
-  const accept = (inq, newD) => { if (newD != null) writeCell(inq.gymnastId, inq.apparatus, { d: newD }); updateInquiry(inq.id, { status: "accepted", newD: newD ?? null, decidedAt: Date.now() }); addLog(`Réclamation acceptée · ${inq.gymnastName} · ${inq.apparatusLabel}${newD != null ? ` · D→${fmt(newD)}` : ""}`); };
-  const reject = (inq) => { updateInquiry(inq.id, { status: "rejected", decidedAt: Date.now() }); addLog(`Réclamation rejetée · ${inq.gymnastName} · ${inq.apparatusLabel}`); };
+  const accept = async (inq, newD) => {
+    if (newD != null) {
+      if (!Number.isFinite(newD) || newD < 0) { setSupervisorError("Nouvelle note D invalide."); return; }
+      if ((await writeCell(inq.gymnastId, inq.apparatus, { d: newD })) === null) return;
+    }
+    if ((await updateInquiry(inq.id, { status: "accepted", newD: newD ?? null, decidedAt: Date.now() })) !== null)
+      await addLog(`Réclamation acceptée · ${inq.gymnastName} · ${inq.apparatusLabel}${newD != null ? ` · D→${fmt(newD)}` : ""}`);
+  };
+  const reject = async (inq) => {
+    if ((await updateInquiry(inq.id, { status: "rejected", decidedAt: Date.now() })) !== null)
+      await addLog(`Réclamation rejetée · ${inq.gymnastName} · ${inq.apparatusLabel}`);
+  };
 
   const validatedCells = [];
   roster.forEach((g) => { const d = divOf(g.division); if (!d || d.discipline !== incDisc) return; apparatusOf(d.discipline).forEach((a) => { const cell = scores?.[g.id]?.[a.id]; if (cell?.status === "validated") validatedCells.push({ g, d, a, total: cellTotal(cell, d) }); }); });
-  const unlock = (g, d, a) => { writeCell(g.id, a.id, { status: "draft" }); addLog(`Déverrouillage · ${g.name} · ${d.discipline} ${d.label} · ${a.label}`); };
+  const unlock = async (g, d, a) => {
+    if ((await writeCell(g.id, a.id, { status: "draft" })) !== null)
+      await addLog(`Déverrouillage · ${g.name} · ${d.discipline} ${d.label} · ${a.label}`);
+  };
   const hhmm = (ts) => new Date(ts).toLocaleTimeString("fr-BE", { hour: "2-digit", minute: "2-digit" });
 
   return (
     <div className="space-y-4 risein">
+      {supervisorError && <div role="alert" className="panel p-3" style={{ color: "var(--late)" }}>{supervisorError}</div>}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="flex gap-1">
           <button onClick={() => setTab("rec")} className={`seg ${tab === "rec" ? "seg-gold" : ""}`}>Réclamations{pending.length > 0 ? ` (${pending.length})` : ""}</button>
@@ -1628,8 +1697,8 @@ function SupervisorApp({ config, roster, scores, inquiries, updateInquiry, write
             {chat.map((m, i) => <div key={i} className="panel2 p-2 text-sm"><span className="gold disp" style={{ fontWeight: 600 }}>{m.author}</span> <span className="faint num text-xs">{hhmm(m.ts)}</span><div className="dim">{m.text}</div></div>)}
           </div>
           <div className="flex gap-2">
-            <input className="inp flex-1" placeholder="Message rapide…" value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && msg.trim()) { addChat(msg.trim()); setMsg(""); } }} />
-            <button onClick={() => { if (msg.trim()) { addChat(msg.trim()); setMsg(""); } }} className="btn btn-gold">Envoyer</button>
+            <input className="inp flex-1" placeholder="Message rapide…" value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void sendMessage(); }} />
+            <button onClick={() => void sendMessage()} className="btn btn-gold">Envoyer</button>
           </div>
         </div>
       )}
