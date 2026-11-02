@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { store } from "./store";
 import { parseNum, isValidNumberInput, checkCell } from "./scoreRules.js";
+import { csvFromRows } from "./csvUtils.js";
 
 /* ================================================================== *
  *  Console de compétition GAF / GAM — FfG (v4)
@@ -641,7 +642,7 @@ function Landing({ config, roster, scores, live, lastSync, onPublic, onStaff }) 
 
 function StaffGate({ config, onOk, onBack }) {
   const [pw, setPw] = useState(""); const [err, setErr] = useState("");
-  const submit = () => { if (pw.trim().toUpperCase() === String(config.staffPassword || "").toUpperCase()) onOk(); else setErr("Mot de passe incorrect."); };
+  const submit = () => { if (pw.trim() && config.staffPassword && pw.trim().toUpperCase() === String(config.staffPassword).toUpperCase()) onOk(); else setErr("Mot de passe incorrect ou non configuré."); };
   return (
     <div className="ff appbg grain" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
       <div className="w-full max-w-sm risein panel p-5">
@@ -2118,7 +2119,8 @@ function RankingsView({ config, roster, scores }) {
   const teams = {}; group.forEach((g) => { if (g.team) (teams[g.team] ||= []).push(g); });
   const teamRows = div ? Object.entries(teams).map(([team, m2]) => { let total = 0; aps.forEach((a) => { const vs = m2.map((m) => validatedTotal(scores?.[m.id]?.[a.id], div)).filter((v) => v != null).sort((x, y) => y - x); total += vs.slice(0, config.teamBestN).reduce((s, v) => s + v, 0); }); return { team, total: round2(total), n: m2.length }; }).sort((a, b) => (b.total - a.total) || a.team.localeCompare(b.team)) : [];
   const [showCsv, setShowCsv] = useState(false);
-  const csv = (() => { const esc = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`; let R = []; if (view === "cg") { R.push(["Rang", "Gymnaste", "Club", ...aps.map((a) => a.label), "Total"]); cg.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, ...x.per.map((p) => fmt(p)), fmt(x.total)])); } else if (view === "agres") { R.push(["Rang", "Gymnaste", "Club", aps.find((a) => a.id === ap)?.label || ""]); byAp.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, fmt(x.s)])); } else { R.push(["Rang", "Équipe", "Gymnastes", "Total"]); teamRows.forEach((x, i) => R.push([i + 1, x.team, x.n, fmt(x.total)])); } return R.map((r) => r.map(esc).join(",")).join("\n"); })();
+  const csv = (() => { const R = []; if (view === "cg") { R.push(["Rang", "Gymnaste", "Club", ...aps.map((a) => a.label), "Total"]); cg.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, ...x.per.map((p) => fmt(p)), fmt(x.total)])); } else if (view === "agres") { R.push(["Rang", "Gymnaste", "Club", aps.find((a) => a.id === ap)?.label || ""]); byAp.forEach((x, i) => R.push([i + 1, x.g.name, x.g.club, fmt(x.s)])); } else { R.push(["Rang", "Équipe", "Gymnastes", "Total"]); teamRows.forEach((x, i) => R.push([i + 1, x.team, x.n, fmt(x.total)])); } return csvFromRows(R); })();
+  const downloadCsv = () => { const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `arena-grilles-${discipline}-${division || "tous"}-${view}.csv`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1500); };
 
   return (
     <div className="space-y-4 risein">
@@ -2131,7 +2133,7 @@ function RankingsView({ config, roster, scores }) {
         </div>
         {view === "agres" && <Field label="Agrès">{seg(ap, setAp, aps.map((a) => ({ v: a.id, l: a.label })))}</Field>}
         <div className="flex gap-2 pt-1">
-          <button onClick={() => setShowCsv((v) => !v)} className="btn" style={{ fontSize: ".78rem" }}>Exporter (CSV)</button>
+          <button onClick={downloadCsv} className="btn" style={{ fontSize: ".78rem" }}>Télécharger CSV</button><button onClick={() => setShowCsv((v) => !v)} className="btn" style={{ fontSize: ".78rem" }}>Copier CSV</button>
           <button onClick={() => { try { window.print(); } catch (e) {} }} className="btn" style={{ fontSize: ".78rem" }}>Imprimer</button>
         </div>
         {showCsv && <textarea readOnly className="inp w-full num" rows={6} value={csv} onFocus={(e) => e.target.select()} style={{ fontSize: ".72rem", resize: "vertical" }} />}
