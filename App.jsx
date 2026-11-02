@@ -163,7 +163,7 @@ const round2 = (n) => Math.round(n * 100) / 100;
 const fmt = (n) => (n == null ? "—" : round2(n).toFixed(2));
 const fmt3 = (n) => (n == null ? "—" : Number(n).toFixed(3));
 const parseTime = (t) => { const [h, m] = (t || "0:0").split(":").map(Number); return h * 60 + m; };
-const toClock = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(Math.round(m % 60)).padStart(2, "0")}`;
+const toClock = (m) => { const minutes = ((Math.round(Number(m) || 0) % 1440) + 1440) % 1440; return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`; };
 const rotTime = (config, disc, rot) => { const o = config.schedule.times?.[disc]?.[rot]; return (o != null && o !== "") ? parseTime(o) : parseTime(config.schedule.startTime) + rot * config.schedule.durationMin; };
 const combine = (values, rule) => {
   const a = values.filter((v) => v != null && !isNaN(v)).sort((x, y) => x - y);
@@ -342,6 +342,9 @@ export default function App() {
         if ((await store.get(ROSTER_KEY)) === null) {
           await store.initialize(ROSTER_KEY, seedRoster());
         }
+        if ((await store.get(LIVE_KEY)) === null) {
+          await store.initialize(LIVE_KEY, { discipline: "GAF", currentRotation: 0, startedAt: {} });
+        }
         if (active) {
           await refreshAll();
           setSyncError("");
@@ -432,13 +435,13 @@ export default function App() {
   }, [safeSave]);
 
   const saveConfig = useCallback(async (c) => {
-    const saved = await safeSave(() => store.set(CONFIG_KEY, c));
-    if (saved !== null) setConfig(c);
-  }, [safeSave]);
+    const saved = await safeSave(() => store.atomic(CONFIG_KEY, "config_cas", { expected: config, value: c }));
+    if (saved !== null) setConfig(saved);
+  }, [safeSave, config]);
   const saveLive = useCallback(async (l) => {
-    const saved = await safeSave(() => store.set(LIVE_KEY, l));
-    if (saved !== null) setLive(l);
-  }, [safeSave]);
+    const saved = await safeSave(() => store.atomic(LIVE_KEY, "live_cas", { expected: live, value: l }));
+    if (saved !== null) setLive(saved);
+  }, [safeSave, live]);
   const addGymnast = useCallback(async (g) => {
     const item = { ...g, id: "g" + Date.now() + Math.random().toString(36).slice(2) };
     await atomicSave(ROSTER_KEY, "roster_add", { item }, setRoster);
@@ -450,9 +453,11 @@ export default function App() {
     await atomicSave(ROSTER_KEY, "roster_edit", { id, patch }, setRoster);
   }, [atomicSave]);
   const replaceRoster = useCallback(async (arr) => {
-    const saved = await safeSave(() => store.set(ROSTER_KEY, arr));
-    if (saved !== null) setRoster(arr);
-  }, [safeSave]);
+    const saved = await safeSave(() => store.atomic(ROSTER_KEY, "roster_replace_cas", {
+      expected: roster, value: arr
+    }));
+    if (saved !== null) setRoster(saved);
+  }, [safeSave, roster]);
   const writeCell = useCallback(async (gid, aid, patch) => {
     return atomicSave(SCORES_KEY, "score_patch", { gid, aid, patch }, setScores);
   }, [atomicSave]);
@@ -1080,7 +1085,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
   useEffect(() => { const list = config.divisions.filter((d) => d.discipline === disc); if (!list.find((d) => d.id === division)) setDivision(list[0]?.id); if (!locked) setAp(apparatusOf(disc)[0].id); }, [disc]);
   const div = config.divisions.find((d) => d.id === division);
   const maxJudges = div?.judges || 3;
-  useEffect(() => { if (jn > maxJudges) setJn(1); }, [maxJudges]);
+  useEffect(() => { if (organiser && jn > maxJudges) setJn(1); }, [maxJudges, organiser]);
   const apLabel = apparatusOf(disc).find((a) => a.id === ap)?.label;
   const outOfPanel = !organiser && !!div && jn > div.judges;
   const frozen = !!config.frozen;
