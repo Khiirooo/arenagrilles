@@ -33,6 +33,8 @@ begin
     or (p_key = 'ffg10:roster' and p_action in ('roster_add', 'roster_edit', 'roster_delete'))
     or (p_key = 'ffg10:inquiries' and p_action in ('inquiry_add', 'inquiry_edit'))
     or (p_key = 'ffg10:presence' and p_action in ('presence_beat', 'presence_claim', 'presence_release'))
+    or (p_key = 'ffg10:log' and p_action = 'log_add')
+    or (p_key = 'ffg10:chat' and p_action = 'chat_add')
   ) then
     raise exception 'Mutation non autorisée : % / %', p_key, p_action using errcode = '22023';
   end if;
@@ -41,7 +43,7 @@ begin
   -- ON CONFLICT DO NOTHING rend l'initialisation concurrente inoffensive.
   insert into public.kv (key, value, updated_at)
   values (p_key,
-    case when p_key in ('ffg10:roster', 'ffg10:inquiries') then '[]'::jsonb
+    case when p_key in ('ffg10:roster', 'ffg10:inquiries', 'ffg10:log', 'ffg10:chat') then '[]'::jsonb
          else '{}'::jsonb end,
     now())
   on conflict (key) do nothing;
@@ -111,6 +113,44 @@ begin
         order by x.ord
       ), '[]'::jsonb) into v
       from jsonb_array_elements(v) with ordinality as x(item, ord);
+    end if;
+
+  elsif p_action in ('log_add', 'chat_add') then
+    v_item := p_payload->'item';
+    v_id := nullif(v_item->>'id', '');
+    if v_id is null or length(v_id) > 120
+       or jsonb_typeof(v_item) <> 'object'
+       or length(btrim(coalesce(v_item->>'text', ''))) < 1
+       or length(v_item->>'text') > 1000 then
+      raise exception 'Message ou identifiant invalide' using errcode = '22023';
+    end if;
+    if jsonb_typeof(v) <> 'array' then
+      raise exception 'Historique invalide' using errcode = '22023';
+    end if;
+    -- Réessais réseau idempotents (une entrée ne doit pas être créée deux fois).
+    if not exists (select 1 from jsonb_array_elements(v) as x(item)
+                   where x.item->>'id' = v_id) then
+      v_item := jsonb_build_object(
+        'id', v_id,
+        'ts', v_now,
+        'author', left(coalesce(v_item->>'author', 'Superviseur'), 80),
+        'text', btrim(v_item->>'text')
+      );
+      if p_action = 'log_add' then
+        v := jsonb_build_array(v_item) || v;
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord limit 100
+        ) y;
+      else
+        v := v || jsonb_build_array(v_item);
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord desc limit 100
+        ) y;
+      end if;
     end if;
 
   elsif p_action in ('presence_beat', 'presence_claim', 'presence_release') then
