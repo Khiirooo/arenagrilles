@@ -24,6 +24,14 @@ declare
   v_occupied boolean;
   v_scores jsonb;
   v_backup text;
+  v_roster jsonb;
+  v_config jsonb;
+  v_gym jsonb;
+  v_div jsonb;
+  v_note jsonb;
+  v_count integer;
+  v_j integer;
+  v_limit numeric;
   v_now bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
 begin
   if p_payload is null or jsonb_typeof(p_payload) <> 'object' then
@@ -114,6 +122,451 @@ begin
         'notes', coalesce(v_cell->'notes', '{}'::jsonb) || coalesce(v_patch->'notes', '{}'::jsonb),
         'ts', v_now
       );
+      -- Interdire la publication d'une note incomplète, même si un ancien
+      -- navigateur contourne les contrôles React.
+      if v_patch->>'status' in ('submitted', 'validated') then
+        select value into v_roster from public.kv where key = 'ffg10:roster';
+        select value into v_config from public.kv where key = 'ffg10:config';
+        if jsonb_typeof(v_roster) <> 'array'
+          or jsonb_typeof(v_config->'divisions') <> 'array' then
+          raise exception 'Configuration de concours absente' using errcode = '22023';
+        end if;
+
+        select x.item into v_gym
+          from jsonb_array_elements(v_roster) as x(item)
+          where x.item->>'id' = v_id limit 1;
+        select x.item into v_div
+          from jsonb_array_elements(v_config->'divisions') as x(item)
+          where x.item->>'id' = v_gym->>'division' limit 1;
+        if v_div is null then
+          raise exception 'Division inconnue pour la note' using errcode = '22023';
+        end if;
+        if coalesce(v_div->>'judges', '') !~ '^[1-9][0-9]*
+    end if;
+    v := jsonb_set(v, array[v_id], v_group, true);
+
+  elsif p_action in ('roster_add', 'roster_edit', 'roster_delete') then
+    if jsonb_typeof(v) <> 'array' then raise exception 'Liste gymnastes invalide'; end if;
+    if p_action = 'roster_add' then
+      v_item := p_payload->'item';
+      v_id := nullif(v_item->>'id', '');
+      if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Inscription invalide'; end if;
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
+        v := v || jsonb_build_array(v_item);
+      end if;
+    elsif p_action = 'roster_edit' then
+      if v_id is null or jsonb_typeof(v_patch) <> 'object' then raise exception 'Modification invalide'; end if;
+      select coalesce(jsonb_agg(
+        case when x.item->>'id' = v_id then x.item || (v_patch - 'id') else x.item end
+        order by x.ord
+      ), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord);
+    else
+      if v_id is null then raise exception 'Identifiant invalide'; end if;
+      select coalesce(jsonb_agg(x.item order by x.ord), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord)
+      where x.item->>'id' is distinct from v_id;
+    end if;
+
+  elsif p_action in ('inquiry_add', 'inquiry_edit') then
+    if jsonb_typeof(v) <> 'array' then raise exception 'Réclamations invalides'; end if;
+    if p_action = 'inquiry_add' then
+      v_item := p_payload->'item';
+      v_id := nullif(v_item->>'id', '');
+      if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Réclamation invalide'; end if;
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
+        v := jsonb_build_array(v_item) || v;
+      end if;
+    else
+      if v_id is null or jsonb_typeof(v_patch) <> 'object' then raise exception 'Modification invalide'; end if;
+      select coalesce(jsonb_agg(
+        case when x.item->>'id' = v_id then x.item || (v_patch - 'id') else x.item end
+        order by x.ord
+      ), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord);
+    end if;
+
+  elsif p_action in ('log_add', 'chat_add') then
+    v_item := p_payload->'item';
+    v_id := nullif(v_item->>'id', '');
+    if v_id is null or length(v_id) > 120
+       or jsonb_typeof(v_item) <> 'object'
+       or length(btrim(coalesce(v_item->>'text', ''))) < 1
+       or length(v_item->>'text') > 1000 then
+      raise exception 'Message ou identifiant invalide' using errcode = '22023';
+    end if;
+    if jsonb_typeof(v) <> 'array' then
+      raise exception 'Historique invalide' using errcode = '22023';
+    end if;
+    -- Réessais réseau idempotents (une entrée ne doit pas être créée deux fois).
+    if not exists (select 1 from jsonb_array_elements(v) as x(item)
+                   where x.item->>'id' = v_id) then
+      v_item := jsonb_build_object(
+        'id', v_id,
+        'ts', v_now,
+        'author', left(coalesce(v_item->>'author', 'Superviseur'), 80),
+        'text', btrim(v_item->>'text')
+      );
+      if p_action = 'log_add' then
+        v := jsonb_build_array(v_item) || v;
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord limit 100
+        ) y;
+      else
+        v := v || jsonb_build_array(v_item);
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord desc limit 100
+        ) y;
+      end if;
+    end if;
+
+  elsif p_action in ('presence_beat', 'presence_claim', 'presence_release') then
+    v_token := nullif(p_payload->>'token', '');
+    v_item := p_payload->'entry';
+    v_slot := nullif(p_payload->>'slot', '');
+    if v_token is null or length(v_token) > 160 then
+      raise exception 'Identifiant de présence invalide' using errcode = '22023';
+    end if;
+    if jsonb_typeof(v) <> 'object' then v := '{}'::jsonb; end if;
+
+    -- Supprimer les sessions expirées sous verrou.
+    select coalesce(jsonb_object_agg(x.k, x.item), '{}'::jsonb) into v
+    from jsonb_each(v) as x(k, item)
+    where case when coalesce(x.item->>'ts', '') ~ '^[0-9]+
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+      then (x.item->>'ts')::numeric > v_now - 45000 else false end;
+
+    if p_action = 'presence_release' then
+      v := v - v_token;
+    elsif p_action = 'presence_claim' then
+      if v_slot is null
+        or v_slot !~ '^juge:(GAF|GAM):[a-z0-9_-]+:(JS|[1-9][0-9]*)
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+        or left(v_token, length(v_slot) + 1) <> v_slot || ':'
+        or jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Poste de juge invalide' using errcode = '22023';
+      end if;
+      select exists (
+        select 1 from jsonb_each(v) as x(k, item)
+        where left(x.k, length(v_slot) + 1) = v_slot || ':'
+        and x.k <> v_token
+      ) into v_occupied;
+      if v_occupied then
+        raise exception 'Ce poste est déjà occupé par un autre appareil. Réessayez dans 45 s si la session précédente est fermée.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    else
+      if jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Présence invalide' using errcode = '22023';
+      end if;
+      -- Un juge ne peut pas récupérer un poste dont il a perdu la réservation.
+      if left(v_token, 5) = 'juge:' and not (v ? v_token) then
+        raise exception 'Réservation du poste de juge expirée : reconnectez-vous.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    end if;
+  end if;
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+ then
+          raise exception 'Nombre de juges invalide' using errcode = '22023';
+        end if;
+        v_count := (v_div->>'judges')::integer;
+        if v_count > 20 then raise exception 'Panel de juges invalide' using errcode = '22023'; end if;
+        if coalesce(v_div->>'start', '') !~ '^[0-9]+(\\.[0-9]+)?
+    end if;
+    v := jsonb_set(v, array[v_id], v_group, true);
+
+  elsif p_action in ('roster_add', 'roster_edit', 'roster_delete') then
+    if jsonb_typeof(v) <> 'array' then raise exception 'Liste gymnastes invalide'; end if;
+    if p_action = 'roster_add' then
+      v_item := p_payload->'item';
+      v_id := nullif(v_item->>'id', '');
+      if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Inscription invalide'; end if;
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
+        v := v || jsonb_build_array(v_item);
+      end if;
+    elsif p_action = 'roster_edit' then
+      if v_id is null or jsonb_typeof(v_patch) <> 'object' then raise exception 'Modification invalide'; end if;
+      select coalesce(jsonb_agg(
+        case when x.item->>'id' = v_id then x.item || (v_patch - 'id') else x.item end
+        order by x.ord
+      ), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord);
+    else
+      if v_id is null then raise exception 'Identifiant invalide'; end if;
+      select coalesce(jsonb_agg(x.item order by x.ord), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord)
+      where x.item->>'id' is distinct from v_id;
+    end if;
+
+  elsif p_action in ('inquiry_add', 'inquiry_edit') then
+    if jsonb_typeof(v) <> 'array' then raise exception 'Réclamations invalides'; end if;
+    if p_action = 'inquiry_add' then
+      v_item := p_payload->'item';
+      v_id := nullif(v_item->>'id', '');
+      if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Réclamation invalide'; end if;
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
+        v := jsonb_build_array(v_item) || v;
+      end if;
+    else
+      if v_id is null or jsonb_typeof(v_patch) <> 'object' then raise exception 'Modification invalide'; end if;
+      select coalesce(jsonb_agg(
+        case when x.item->>'id' = v_id then x.item || (v_patch - 'id') else x.item end
+        order by x.ord
+      ), '[]'::jsonb) into v
+      from jsonb_array_elements(v) with ordinality as x(item, ord);
+    end if;
+
+  elsif p_action in ('log_add', 'chat_add') then
+    v_item := p_payload->'item';
+    v_id := nullif(v_item->>'id', '');
+    if v_id is null or length(v_id) > 120
+       or jsonb_typeof(v_item) <> 'object'
+       or length(btrim(coalesce(v_item->>'text', ''))) < 1
+       or length(v_item->>'text') > 1000 then
+      raise exception 'Message ou identifiant invalide' using errcode = '22023';
+    end if;
+    if jsonb_typeof(v) <> 'array' then
+      raise exception 'Historique invalide' using errcode = '22023';
+    end if;
+    -- Réessais réseau idempotents (une entrée ne doit pas être créée deux fois).
+    if not exists (select 1 from jsonb_array_elements(v) as x(item)
+                   where x.item->>'id' = v_id) then
+      v_item := jsonb_build_object(
+        'id', v_id,
+        'ts', v_now,
+        'author', left(coalesce(v_item->>'author', 'Superviseur'), 80),
+        'text', btrim(v_item->>'text')
+      );
+      if p_action = 'log_add' then
+        v := jsonb_build_array(v_item) || v;
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord limit 100
+        ) y;
+      else
+        v := v || jsonb_build_array(v_item);
+        select coalesce(jsonb_agg(y.item order by y.ord), '[]'::jsonb)
+        into v from (
+          select x.item, x.ord from jsonb_array_elements(v) with ordinality as x(item, ord)
+          order by x.ord desc limit 100
+        ) y;
+      end if;
+    end if;
+
+  elsif p_action in ('presence_beat', 'presence_claim', 'presence_release') then
+    v_token := nullif(p_payload->>'token', '');
+    v_item := p_payload->'entry';
+    v_slot := nullif(p_payload->>'slot', '');
+    if v_token is null or length(v_token) > 160 then
+      raise exception 'Identifiant de présence invalide' using errcode = '22023';
+    end if;
+    if jsonb_typeof(v) <> 'object' then v := '{}'::jsonb; end if;
+
+    -- Supprimer les sessions expirées sous verrou.
+    select coalesce(jsonb_object_agg(x.k, x.item), '{}'::jsonb) into v
+    from jsonb_each(v) as x(k, item)
+    where case when coalesce(x.item->>'ts', '') ~ '^[0-9]+
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+      then (x.item->>'ts')::numeric > v_now - 45000 else false end;
+
+    if p_action = 'presence_release' then
+      v := v - v_token;
+    elsif p_action = 'presence_claim' then
+      if v_slot is null
+        or v_slot !~ '^juge:(GAF|GAM):[a-z0-9_-]+:(JS|[1-9][0-9]*)
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+        or left(v_token, length(v_slot) + 1) <> v_slot || ':'
+        or jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Poste de juge invalide' using errcode = '22023';
+      end if;
+      select exists (
+        select 1 from jsonb_each(v) as x(k, item)
+        where left(x.k, length(v_slot) + 1) = v_slot || ':'
+        and x.k <> v_token
+      ) into v_occupied;
+      if v_occupied then
+        raise exception 'Ce poste est déjà occupé par un autre appareil. Réessayez dans 45 s si la session précédente est fermée.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    else
+      if jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Présence invalide' using errcode = '22023';
+      end if;
+      -- Un juge ne peut pas récupérer un poste dont il a perdu la réservation.
+      if left(v_token, 5) = 'juge:' and not (v ? v_token) then
+        raise exception 'Réservation du poste de juge expirée : reconnectez-vous.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    end if;
+  end if;
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+ then
+          raise exception 'Barème invalide' using errcode = '22023';
+        end if;
+        v_limit := (v_div->>'start')::numeric;
+        if v_limit <= 0 then raise exception 'Barème invalide' using errcode = '22023'; end if;
+
+        if v_div->>'mode' = 'DE' then
+          v_note := v_cell->'d';
+          if jsonb_typeof(v_note) <> 'number' then
+            raise exception 'Note D manquante' using errcode = '22023';
+          end if;
+          if (v_note #>> '{}')::numeric < 0 then
+            raise exception 'Note D négative' using errcode = '22023';
+          end if;
+        end if;
+
+        for v_j in 1..v_count loop
+          v_note := v_cell #> array[
+            case when v_div->>'mode' = 'DE' then 'e' else 'notes' end,
+            v_j::text
+          ];
+          if jsonb_typeof(v_note) <> 'number' then
+            raise exception 'Note du juge % manquante', v_j using errcode = '22023';
+          end if;
+          if (v_note #>> '{}')::numeric < 0
+             or (v_note #>> '{}')::numeric > v_limit then
+            raise exception 'Note du juge % hors barème', v_j using errcode = '22023';
+          end if;
+        end loop;
+        v_note := v_cell->'pen';
+        if v_note is not null and jsonb_typeof(v_note) <> 'null' then
+          if jsonb_typeof(v_note) <> 'number' then
+            raise exception 'Pénalité invalide' using errcode = '22023';
+          end if;
+          if (v_note #>> '{}')::numeric < 0 or (v_note #>> '{}')::numeric > 5 then
+            raise exception 'Pénalité hors barème' using errcode = '22023';
+          end if;
+        end if;
+      end if;
       v_group := jsonb_set(v_group, array[v_ap], v_cell, true);
     end if;
     v := jsonb_set(v, array[v_id], v_group, true);
