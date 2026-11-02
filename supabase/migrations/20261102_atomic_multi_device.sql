@@ -76,7 +76,7 @@ begin
       v_item := p_payload->'item';
       v_id := nullif(v_item->>'id', '');
       if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Inscription invalide'; end if;
-      if not exists (select 1 from jsonb_array_elements(v) as x where x->>'id' = v_id) then
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
         v := v || jsonb_build_array(v_item);
       end if;
     elsif p_action = 'roster_edit' then
@@ -99,7 +99,7 @@ begin
       v_item := p_payload->'item';
       v_id := nullif(v_item->>'id', '');
       if jsonb_typeof(v_item) <> 'object' or v_id is null then raise exception 'Réclamation invalide'; end if;
-      if not exists (select 1 from jsonb_array_elements(v) as x where x->>'id' = v_id) then
+      if not exists (select 1 from jsonb_array_elements(v) as x(item) where x.item->>'id' = v_id) then
         v := jsonb_build_array(v_item) || v;
       end if;
     else
