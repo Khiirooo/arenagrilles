@@ -241,10 +241,45 @@ const STYLE = `
 .flash{animation:flash .9s ease;}
 @keyframes flash{0%{box-shadow:0 0 0 3px var(--gold),0 0 40px #e2ae4688;}100%{box-shadow:none;}}
 @media (prefers-reduced-motion:reduce){.risein,.livedot{animation:none;}}
+@media (max-width: 640px) {
+  .ff { font-size: 14px; }
+  .ff main { padding: 10px !important; }
+  .ff table { display:block; max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .ff button, .ff a.btn { min-height: 40px; }
+  .ff input, .ff select, .ff textarea { font-size: 16px !important; max-width: 100%; }
+  .ff .grid { min-width: 0; }
+  .ff header .max-w-6xl { flex-wrap: wrap; }
+}
 input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.7);}
 `;
 
 /* ============================== APP ============================== */
+
+function SyncBanner({ status, error, retry }) {
+  if (status === "live" && !error) return null;
+  const offline = status === "offline";
+  return (
+    <div role="status" aria-live="polite" style={{
+      position: "fixed", bottom: 12, left: 12, right: 12, margin: "auto",
+      maxWidth: 580, zIndex: 1000, padding: "12px 16px", borderRadius: 12,
+      background: "#181d28", border: "1px solid #d1a753", color: "#f8f4ec",
+      boxShadow: "0 8px 28px #0009", fontFamily: "system-ui,sans-serif",
+      display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap"
+    }}>
+      <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+        <strong>{offline ? "Hors connexion" : status === "fallback" ? "Connexion en cours / mode de secours" : "Connexion au serveur"}</strong>
+        <div style={{ fontSize: 12, marginTop: 3 }}>
+          {error || (offline ? "Les nouvelles notes ne sont pas enregistrées tant que le réseau est indisponible." :
+            "Les résultats restent consultables ; actualisation automatique de secours.")}
+        </div>
+      </div>
+      <button type="button" onClick={retry} style={{ padding: "8px 12px", background: "#e0b961", border: 0, borderRadius: 8, fontWeight: 700, cursor: "pointer", color: "#181d28" }}>
+        Réessayer
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [roster, setRoster] = useState([]);
@@ -256,65 +291,186 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [showGate, setShowGate] = useState(false);
   const [staffOk, setStaffOk] = useState(false);
+  const [syncStatus, setSyncStatus] = useState(navigator.onLine ? "connecting" : "offline");
+  const [syncError, setSyncError] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
+  const tabToken = useRef("tab-" + Math.random().toString(36).slice(2));
 
-  useEffect(() => { (async () => {
-    let c = await store.get(CONFIG_KEY); if (!c || c._v !== CONFIG_VERSION) { c = seedConfig(); await store.set(CONFIG_KEY, c); }
-    let r = await store.get(ROSTER_KEY); if (!r) { r = seedRoster(); await store.set(ROSTER_KEY, r); }
-    setConfig(c); setRoster(r);
-    setScores((await store.get(SCORES_KEY)) || {});
-    setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} });
-    setInquiries((await store.get(INQ_KEY)) || []);
-  })(); }, []);
+
+  const refreshAll = useCallback(async () => {
+    // Les erreurs de lecture ne doivent JAMAIS ressembler à une base vide.
+    const keys = [CONFIG_KEY, ROSTER_KEY, SCORES_KEY, LIVE_KEY, INQ_KEY, PRESENCE_KEY];
+    const [c, r, s, l, i, p] = await Promise.all(keys.map((key) => store.get(key)));
+    if (c) setConfig(c);
+    if (r !== null) setRoster(r);
+    if (s !== null) setScores(s);
+    if (l !== null) setLive(l);
+    if (i !== null) setInquiries(i);
+    if (p !== null) setPresence(p);
+    setLastSync(Date.now());
+  }, []);
 
   useEffect(() => {
-    const iv = setInterval(async () => {
-      setScores((await store.get(SCORES_KEY)) || {});
-      setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} });
-      setRoster((await store.get(ROSTER_KEY)) || []);
-      setInquiries((await store.get(INQ_KEY)) || []);
-      setPresence((await store.get(PRESENCE_KEY)) || {});
-      const c = await store.get(CONFIG_KEY); if (c) setConfig(c);
+    let active = true;
+    const onChanged = (key, value) => {
+      if (!active) return;
+      if (key === CONFIG_KEY) setConfig(value);
+      if (key === ROSTER_KEY) setRoster(value);
+      if (key === SCORES_KEY) setScores(value);
+      if (key === LIVE_KEY) setLive(value);
+      if (key === INQ_KEY) setInquiries(value);
+      if (key === PRESENCE_KEY) setPresence(value);
       setLastSync(Date.now());
-    }, 10000);
-    return () => clearInterval(iv);
-  }, []);
+    };
+    const stopWatching = store.watch(onChanged, (state) => {
+      if (!active) return;
+      setSyncStatus(state === "SUBSCRIBED" ? "live" : (navigator.onLine ? "fallback" : "offline"));
+    });
+    const showError = (error) => {
+      if (!active) return;
+      console.error("Arena Grilles : connexion", error);
+      setSyncError(error?.message || "Connexion au serveur impossible.");
+      setSyncStatus(navigator.onLine ? "fallback" : "offline");
+    };
+    const boot = async () => {
+      try {
+        // Ne jamais réécrire la configuration d'une compétition déjà paramétrée
+        // parce qu'un autre appareil se connecte avec une nouvelle version.
+        if ((await store.get(CONFIG_KEY)) === null) {
+          await store.initialize(CONFIG_KEY, seedConfig());
+        }
+        if ((await store.get(ROSTER_KEY)) === null) {
+          await store.initialize(ROSTER_KEY, seedRoster());
+        }
+        if (active) {
+          await refreshAll();
+          setSyncError("");
+        }
+      } catch (error) { showError(error); }
+    };
+    const resyncNow = () => {
+      if (navigator.onLine) void refreshAll().then(() => {
+        if (active) setSyncError("");
+      }).catch(showError);
+    };
+    const online = () => {
+      if (active) setSyncStatus("fallback");
+      resyncNow();
+    };
+    const offline = () => { if (active) setSyncStatus("offline"); };
+    const visibility = () => { if (!document.hidden) resyncNow(); };
+    window.addEventListener("online", online);
+    window.addEventListener("offline", offline);
+    document.addEventListener("visibilitychange", visibility);
+    const fallback = setInterval(() => {
+      if (!document.hidden && navigator.onLine) resyncNow();
+    }, 20000);
+    void boot();
+    return () => {
+      active = false;
+      stopWatching();
+      clearInterval(fallback);
+      window.removeEventListener("online", online);
+      window.removeEventListener("offline", offline);
+      document.removeEventListener("visibilitychange", visibility);
+    };
+  }, [refreshAll, retryNonce]);
 
   useEffect(() => {
     if (!session || session.role === "public") return;
-    const key = sessionKey(session); let on = true;
-    const beat = async () => { if (!on) return; const p = (await store.get(PRESENCE_KEY)) || {}; const now = Date.now(); p[key] = { label: sessionLabel(session), role: session.role, ts: now }; Object.keys(p).forEach((k) => { if (now - (p[k]?.ts || 0) > 60000) delete p[k]; }); await store.set(PRESENCE_KEY, p); setPresence(p); };
-    beat(); const iv = setInterval(beat, 8000); return () => { on = false; clearInterval(iv); };
+    const token = sessionKey(session) + ":" + tabToken.current;
+    let active = true;
+    const beat = async () => {
+      try {
+        const next = await store.atomic(PRESENCE_KEY, "presence_beat", {
+          token, entry: { label: sessionLabel(session), role: session.role }
+        });
+        if (active) setPresence(next);
+      } catch (error) {
+        // La présence est indicative et ne doit jamais interrompre la saisie des notes.
+        console.warn("Présence temporairement indisponible", error);
+      }
+    };
+    void beat();
+    const iv = setInterval(() => void beat(), 12000);
+    return () => { active = false; clearInterval(iv); };
   }, [session]);
 
-  const saveConfig = useCallback(async (c) => { setConfig(c); await store.set(CONFIG_KEY, c); }, []);
-  const saveLive = useCallback(async (l) => { setLive(l); await store.set(LIVE_KEY, l); }, []);
-  const addGymnast = useCallback(async (g) => { const item = { ...g, id: "g" + Date.now() + Math.floor(Math.random() * 1000) }; let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = [...l, item]; await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; if (chk.find((x) => x.id === item.id)) { n = chk; break; } } setRoster(n); }, []);
-  const removeGymnast = useCallback(async (id) => { let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = l.filter((x) => x.id !== id); await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; if (!chk.find((x) => x.id === id)) { n = chk; break; } } setRoster(n); }, []);
-  const editGymnast = useCallback(async (id, patch) => { let n; for (let i = 0; i < 4; i++) { const l = (await store.get(ROSTER_KEY)) || []; n = l.map((x) => (x.id === id ? { ...x, ...patch } : x)); await store.set(ROSTER_KEY, n); const chk = (await store.get(ROSTER_KEY)) || []; const it = chk.find((x) => x.id === id); if (it && Object.keys(patch).every((k) => it[k] === patch[k])) { n = chk; break; } } setRoster(n); }, []);
-  const replaceRoster = useCallback(async (arr) => { setRoster(arr); await store.set(ROSTER_KEY, arr); }, []);
-  const writeCell = useCallback(async (gid, aid, patch) => {
-    let m;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const l = (await store.get(SCORES_KEY)) || {};
-      m = { ...l, [gid]: { ...(l[gid] || {}) } };
-      const prev = m[gid][aid] || {};
-      m[gid][aid] = { ...prev, ...patch, ts: Date.now(), e: { ...(prev.e || {}), ...(patch.e || {}) }, notes: { ...(prev.notes || {}), ...(patch.notes || {}) } };
-      await store.set(SCORES_KEY, m);
-      const check = (await store.get(SCORES_KEY)) || {}; const c = check[gid]?.[aid] || {};
-      const ok = Object.keys(patch).every((k) => (k === "e" || k === "notes") ? Object.keys(patch[k]).every((s) => c[k]?.[s] === patch[k][s]) : c[k] === patch[k]);
-      if (ok) { m = check; break; }
+  const safeSave = useCallback(async (work) => {
+    try {
+      if (!navigator.onLine) throw new Error("Pas de connexion Internet : modification non enregistrée.");
+      const value = await work();
+      setSyncError("");
+      return value;
+    } catch (error) {
+      console.error("Arena Grilles : sauvegarde", error);
+      setSyncError((error?.message || "Enregistrement impossible.") +
+        " Vérifiez la connexion et réessayez. Aucune sauvegarde n'est confirmée.");
+      setSyncStatus(navigator.onLine ? "fallback" : "offline");
+      return null;
     }
-    setScores(m);
   }, []);
-  const addInquiry = useCallback(async (inq) => { const l = (await store.get(INQ_KEY)) || []; const n = [{ ...inq, id: "i" + Date.now(), filedAt: Date.now(), status: "pending" }, ...l]; setInquiries(n); await store.set(INQ_KEY, n); }, []);
-  const updateInquiry = useCallback(async (id, patch) => { const l = (await store.get(INQ_KEY)) || []; const n = l.map((x) => (x.id === id ? { ...x, ...patch } : x)); setInquiries(n); await store.set(INQ_KEY, n); }, []);
-  const deleteCell = useCallback(async (gid, aid) => { const l = (await store.get(SCORES_KEY)) || {}; if (l[gid]) { const m = { ...l, [gid]: { ...l[gid] } }; delete m[gid][aid]; setScores(m); await store.set(SCORES_KEY, m); } }, []);
-  const resync = useCallback(async () => { setScores((await store.get(SCORES_KEY)) || {}); setRoster((await store.get(ROSTER_KEY)) || []); setLive((await store.get(LIVE_KEY)) || { discipline: "GAF", currentRotation: 0, startedAt: {} }); setInquiries((await store.get(INQ_KEY)) || []); setPresence((await store.get(PRESENCE_KEY)) || {}); const c = await store.get(CONFIG_KEY); if (c) setConfig(c); }, []);
+
+  const atomicSave = useCallback(async (key, action, payload, apply) => {
+    const next = await safeSave(() => store.atomic(key, action, payload));
+    if (next !== null) {
+      apply(next);
+      setLastSync(Date.now());
+    }
+    return next;
+  }, [safeSave]);
+
+  const saveConfig = useCallback(async (c) => {
+    const saved = await safeSave(() => store.set(CONFIG_KEY, c));
+    if (saved !== null) setConfig(c);
+  }, [safeSave]);
+  const saveLive = useCallback(async (l) => {
+    const saved = await safeSave(() => store.set(LIVE_KEY, l));
+    if (saved !== null) setLive(l);
+  }, [safeSave]);
+  const addGymnast = useCallback(async (g) => {
+    const item = { ...g, id: "g" + Date.now() + Math.random().toString(36).slice(2) };
+    await atomicSave(ROSTER_KEY, "roster_add", { item }, setRoster);
+  }, [atomicSave]);
+  const removeGymnast = useCallback(async (id) => {
+    await atomicSave(ROSTER_KEY, "roster_delete", { id }, setRoster);
+  }, [atomicSave]);
+  const editGymnast = useCallback(async (id, patch) => {
+    await atomicSave(ROSTER_KEY, "roster_edit", { id, patch }, setRoster);
+  }, [atomicSave]);
+  const replaceRoster = useCallback(async (arr) => {
+    const saved = await safeSave(() => store.set(ROSTER_KEY, arr));
+    if (saved !== null) setRoster(arr);
+  }, [safeSave]);
+  const writeCell = useCallback(async (gid, aid, patch) => {
+    await atomicSave(SCORES_KEY, "score_patch", { gid, aid, patch }, setScores);
+  }, [atomicSave]);
+  const addInquiry = useCallback(async (inq) => {
+    const item = { ...inq, id: "i" + Date.now() + Math.random().toString(36).slice(2), filedAt: Date.now(), status: "pending" };
+    await atomicSave(INQ_KEY, "inquiry_add", { item }, setInquiries);
+  }, [atomicSave]);
+  const updateInquiry = useCallback(async (id, patch) => {
+    await atomicSave(INQ_KEY, "inquiry_edit", { id, patch }, setInquiries);
+  }, [atomicSave]);
+  const deleteCell = useCallback(async (gid, aid) => {
+    await atomicSave(SCORES_KEY, "score_delete", { gid, aid }, setScores);
+  }, [atomicSave]);
+  const resync = useCallback(async () => {
+    try {
+      await refreshAll();
+      setSyncError("");
+    } catch (error) { setSyncError(error?.message || "Synchronisation impossible."); }
+  }, [refreshAll]);
 
   useEffect(() => { if (config?.eventName) document.title = "Arena Grilles — " + config.eventName; }, [config]);
 
-  if (!config) return <div className="ff appbg" style={{ minHeight: "100vh", padding: 32 }}>Chargement…</div>;
-  if (!session) return <><style>{STYLE}</style>{
+  if (!config) return <div className="ff appbg" style={{ minHeight: "100vh", padding: 32, color: "white" }}>
+    <style>{STYLE}</style>
+    <div>Chargement de la compétition…</div>
+    {syncError && <p role="alert" style={{ marginTop: 14, color: "#ffbd89" }}>{syncError}</p>}
+    <button className="btn btn-gold" style={{ marginTop: 16 }} onClick={() => setRetryNonce((n) => n + 1)}>Réessayer</button>
+  </div>;
+  if (!session) return <><style>{STYLE}</style><SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} />{
     !showGate ? <Landing config={config} roster={roster} scores={scores} live={live} lastSync={lastSync} onPublic={(mode) => setSession({ role: "public", mode })} onStaff={() => setShowGate(true)} />
       : !staffOk ? <StaffGate config={config} onOk={() => setStaffOk(true)} onBack={() => setShowGate(false)} />
         : <Gate config={config} onEnter={setSession} presence={presence} onBack={() => { setStaffOk(false); setShowGate(false); }} />
@@ -326,6 +482,7 @@ export default function App() {
   return (
     <div className="ff appbg grain" style={{ minHeight: "100vh" }}>
       <style>{STYLE}</style>
+      <SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} />
       <header style={{ borderBottom: "1px solid var(--line)", position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(8px)", background: "#0a0b0dcc" }}>
         <div className="max-w-6xl mx-auto px-4 py-2.5 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
