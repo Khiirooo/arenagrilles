@@ -1,0 +1,11 @@
+{
+  "name": "Arena Grilles · GAF/GAM",
+  "short_name": "Arena Grilles",
+  "description": "Console de compétition de gymnastique en direct",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#081733",
+  "theme_color": "#081733",
+  "lang": "fr",
+  "icons": [{ "src": "/icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any maskable" }]
+}
