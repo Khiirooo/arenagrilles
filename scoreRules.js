@@ -19,9 +19,14 @@ function validFinite(n) {
 export function checkCell(cell, division) {
   if (!division) return "Division inconnue";
   if (!cell || typeof cell !== "object") return "Notes manquantes";
-  const judges = Number(division.judges);
-  const count = Number.isInteger(judges) && judges >= 1 && judges <= 20 ? judges : 1;
-  const ceiling = Number(division.start) > 0 ? Number(division.start) : 10;
+  if (division.mode !== "DE" && division.mode !== "single")
+    return "Mode de notation inconnu";
+  const count = Number(division.judges);
+  if (!Number.isInteger(count) || count < 1 || count > 20)
+    return "Nombre de juges invalide";
+  const ceiling = Number(division.start);
+  if (!Number.isFinite(ceiling) || ceiling <= 0)
+    return "Barème invalide";
 
   if (division.mode === "DE") {
     if (!validFinite(cell.d) || cell.d < 0) return "Note D manquante ou invalide";
