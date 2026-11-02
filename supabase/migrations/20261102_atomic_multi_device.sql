@@ -22,6 +22,8 @@ declare
   v_token text;
   v_slot text;
   v_occupied boolean;
+  v_scores jsonb;
+  v_backup text;
   v_now bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
 begin
   if p_payload is null or jsonb_typeof(p_payload) <> 'object' then
@@ -29,8 +31,8 @@ begin
   end if;
 
   if not (
-    (p_key = 'ffg10:scores' and p_action in ('score_patch', 'score_delete'))
-    or (p_key = 'ffg10:roster' and p_action in ('roster_add', 'roster_edit', 'roster_delete'))
+    (p_key = 'ffg10:scores' and p_action in ('score_patch', 'score_delete', 'scores_reset'))
+    or (p_key = 'ffg10:roster' and p_action in ('roster_add', 'roster_edit', 'roster_delete', 'competition_reset'))
     or (p_key = 'ffg10:inquiries' and p_action in ('inquiry_add', 'inquiry_edit'))
     or (p_key = 'ffg10:presence' and p_action in ('presence_beat', 'presence_claim', 'presence_release'))
     or (p_key = 'ffg10:log' and p_action = 'log_add')
@@ -52,7 +54,31 @@ begin
   v_id := nullif(p_payload->>'id', '');
   v_patch := p_payload->'patch';
 
-  if p_action in ('score_patch', 'score_delete') then
+  if p_action = 'scores_reset' then
+    -- Sauvegarde avant effacement, dans la même transaction.
+    v_backup := 'ffg10:backup:' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISSMS') ||
+                ':' || substr(md5(random()::text), 1, 8);
+    insert into public.kv (key, value, updated_at)
+    values (v_backup, jsonb_build_object('kind', 'scores_reset', 'scores', v), now());
+    v := '{}'::jsonb;
+
+  elsif p_action = 'competition_reset' then
+    -- Effacement roster + scores indivisible : si l'une des écritures échoue,
+    -- tout est annulé et la sauvegarde n'est pas perdue.
+    insert into public.kv (key, value, updated_at)
+    values ('ffg10:scores', '{}'::jsonb, now())
+    on conflict (key) do nothing;
+    select value into v_scores from public.kv where key = 'ffg10:scores' for update;
+    v_backup := 'ffg10:backup:' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISSMS') ||
+                ':' || substr(md5(random()::text), 1, 8);
+    insert into public.kv (key, value, updated_at)
+    values (v_backup, jsonb_build_object('kind', 'competition_reset',
+      'roster', v, 'scores', v_scores), now());
+    update public.kv set value = '{}'::jsonb, updated_at = now()
+      where key = 'ffg10:scores';
+    v := '[]'::jsonb;
+
+  elsif p_action in ('score_patch', 'score_delete') then
     v_id := nullif(p_payload->>'gid', '');
     v_ap := nullif(p_payload->>'aid', '');
     if v_id is null or v_ap is null or length(v_id) > 128 or length(v_ap) > 128 then
