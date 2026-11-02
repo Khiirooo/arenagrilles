@@ -4,6 +4,7 @@ import {
   Monitor, LogOut, Play, ChevronRight, KeyRound, ShieldCheck, Eye, Flag, Bell, Mic, Pencil, Share2, Star
 } from "lucide-react";
 import { store } from "./store";
+import { parseNum, isValidNumberInput, checkCell } from "./scoreRules.js";
 
 /* ================================================================== *
  *  Console de compétition GAF / GAM — FfG (v4)
@@ -158,7 +159,6 @@ const seedRoster = () => ([
 ]);
 
 /* ------------------------------ helpers ------------------------------ */
-const parseNum = (v) => { if (v === "" || v == null) return null; const n = parseFloat(String(v).replace(",", ".")); return isNaN(n) ? null : n; };
 const round2 = (n) => Math.round(n * 100) / 100;
 const fmt = (n) => (n == null ? "—" : round2(n).toFixed(2));
 const fmt3 = (n) => (n == null ? "—" : Number(n).toFixed(3));
@@ -185,7 +185,7 @@ const cellTotal = (cell, div) => {
   const bonus = div.bonus ? (cell.bonus || 0) : 0;
   return round2(b + bonus - pen);
 };
-const validatedTotal = (cell, div) => (cell && cell.status === "validated") ? cellTotal(cell, div) : null;
+const validatedTotal = (cell, div) => (cell && cell.status === "validated" && !checkCell(cell, div)) ? cellTotal(cell, div) : null;
 const gymTotal = (scores, div, g) => apparatusOf(div.discipline).reduce((s, a) => s + (validatedTotal(scores?.[g.id]?.[a.id], div) || 0), 0);
 const catsFor = (config, roster, divisionId) => { const s = new Set(roster.filter((g) => g.division === divisionId).map((g) => g.category)); const present = config.categories.filter((c) => s.has(c)); return present.length ? present : config.categories; };
 const matchG = (g, q) => { if (!q) return true; const s = q.toLowerCase(); return g.name.toLowerCase().includes(s) || String(g.dossard || "").includes(s); };
@@ -443,7 +443,7 @@ export default function App() {
     if (saved !== null) setRoster(arr);
   }, [safeSave]);
   const writeCell = useCallback(async (gid, aid, patch) => {
-    await atomicSave(SCORES_KEY, "score_patch", { gid, aid, patch }, setScores);
+    return atomicSave(SCORES_KEY, "score_patch", { gid, aid, patch }, setScores);
   }, [atomicSave]);
   const addInquiry = useCallback(async (inq) => {
     const item = { ...inq, id: "i" + Date.now() + Math.random().toString(36).slice(2), filedAt: Date.now(), status: "pending" };
@@ -867,7 +867,8 @@ function LiveControl({ config, live, saveLive, saveConfig, roster, scores, write
   const pct = tot ? Math.round(val / tot * 100) : 0;
   const shiftMin = (min) => { const t = { ...(config.schedule.times || {}) }; if (t[disc]) { const nd = {}; Object.entries(t[disc]).forEach(([k, v]) => { nd[k] = toClock(Math.max(0, parseTime(v) + min)); }); t[disc] = nd; } saveConfig({ ...config, schedule: { ...config.schedule, startTime: toClock(Math.max(0, parseTime(config.schedule.startTime) + min)), times: t } }); };
   const recalerNow = () => { const dd = nowMin - rotTime(config, disc, r); const t = { ...(config.schedule.times || {}) }; const nd = { ...(t[disc] || {}) }; for (let k = r; k < aps.length; k++) nd[k] = toClock(Math.max(0, rotTime(config, disc, k) + dd)); t[disc] = nd; saveConfig({ ...config, schedule: { ...config.schedule, times: t } }); saveLive({ ...live, startedAt: { ...live.startedAt, [r]: Date.now() } }); };
-  const passerSuite = () => { roster.forEach((g) => { const d = config.divisions.find((x) => x.id === g.division); if (!d || d.discipline !== disc) return; aps.forEach((a) => { const c = scores?.[g.id]?.[a.id]; if (c?.status === "submitted" && !(d.mode === "DE" && c.d == null)) writeCell(g.id, a.id, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, disc, g.group, a.id) }); }); }); if (r < last) saveLive({ ...live, currentRotation: r + 1, startedAt: { ...live.startedAt, [r + 1]: Date.now() } }); };
+  // Passer à la rotation suivante ne doit PAS publier automatiquement des notes non vérifiées par le juge supérieur.
+  const passerSuite = () => { if (r < last) return saveLive({ ...live, currentRotation: r + 1, startedAt: { ...live.startedAt, [r + 1]: Date.now() } }); };
   const Sec = ({ title, right, children, gold }) => (<section className="panel p-4"><div className="flex items-center justify-between mb-3 flex-wrap gap-2"><h3 className={`disp ${gold ? "gold" : ""}`} style={{ fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", fontSize: ".95rem" }}>{title}</h3>{right}</div>{children}</section>);
 
   return (
@@ -1046,6 +1047,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
   useEffect(() => { if (locked && curGroup) setGroupF(curGroup); }, [rot, disc, ap]);
   const list = roster.filter((g) => g.division === division && (category === "" || g.category === category) && (groupF === "" || g.group === groupF) && matchG(g, q)).sort(bibSort);
   const [pmode, setPmode] = useState("liste");
+  const [savingSubmit, setSavingSubmit] = useState(false);
   const [pmIdx, setPmIdx] = useState(0);
   useEffect(() => { setPmIdx(0); }, [division, category, groupF, ap, disc]);
   const seg = (val, set, opts) => <div className="flex flex-wrap gap-1">{opts.map((o) => <button key={o.v} onClick={() => set(o.v)} className={`seg ${val === o.v ? "seg-on" : ""}`}>{o.l}</button>)}</div>;
@@ -1111,7 +1113,7 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
             {err && jn === 1 && !locked && <div style={{ color: "var(--late)", textAlign: "center", marginTop: 10 }}>{err}</div>}
             <div className="flex items-center justify-between mt-5 gap-2 flex-wrap">
               <button onClick={() => go(-1)} disabled={pmIdx <= 0} className="btn">← Précédent</button>
-              {jn === 1 && !locked && <button onClick={() => { writeCell(g.id, ap, { status: "submitted", submittedAt: Date.now() }); go(1); }} disabled={total == null || !!err} className="btn btn-gold" style={{ fontSize: "1.05rem", padding: ".9rem 1.4rem" }}><Check size={18} />Soumettre & suivant →</button>}
+              {jn === 1 && !locked && <button onClick={async () => { setSavingSubmit(true); try { const saved = await writeCell(g.id, ap, { status: "submitted", submittedAt: Date.now() }); if (saved !== null) go(1); } finally { setSavingSubmit(false); } }} disabled={savingSubmit || total == null || !!err} className="btn btn-gold" style={{ fontSize: "1.05rem", padding: ".9rem 1.4rem" }}><Check size={18} />Soumettre & suivant →</button>}
               <button onClick={() => go(1)} disabled={pmIdx >= list.length - 1} className="btn">Suivant →</button>
             </div>
           </div>
@@ -1164,22 +1166,40 @@ function JudgeView({ config, roster, scores, writeCell, judge, discipline, appar
 function BigNum({ label, value, onCommit, disabled }) {
   const [v, setV] = useState(value ?? ""); const focused = useRef(false);
   useEffect(() => { if (!focused.current) setV(value ?? ""); }, [value]);
-  const commit = () => { if (disabled) return; onCommit(parseNum(v)); };
+  const [invalid, setInvalid] = useState(false);
+  const commit = () => { if (disabled) return; if (!isValidNumberInput(v)) { setInvalid(true); return; } setInvalid(false); void onCommit(parseNum(v)); };
   return (
     <label style={{ textAlign: "center" }}>
-      <div className="lbl" style={{ marginBottom: 4 }}>{label}</div>
-      <input inputMode="decimal" disabled={disabled} value={v} onFocus={() => { focused.current = true; }} onChange={(e) => setV(e.target.value)} onBlur={() => { focused.current = false; commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" className="inp num text-center" style={{ width: 110, fontSize: "2rem", fontWeight: 800, padding: ".5rem", opacity: disabled ? .5 : 1 }} />
+      <div className="lbl" style={{ marginBottom: 4, color: invalid ? "var(--late)" : undefined }}>{label}{invalid ? " (nombre invalide)" : ""}</div>
+      <input inputMode="decimal" disabled={disabled} value={v} onFocus={() => { focused.current = true; }} onChange={(e) => { setV(e.target.value); setInvalid(false); }} onBlur={() => { focused.current = false; commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" className="inp num text-center" style={{ width: 110, fontSize: "2rem", fontWeight: 800, padding: ".5rem", opacity: disabled ? .5 : 1 }} />
     </label>
   );
 }
 function NumInput({ label, value, onCommit, w = 56, disabled }) {
-  const [local, setLocal] = useState(value ?? ""); const [saved, setSaved] = useState(false);
-  useEffect(() => { setLocal(value ?? ""); }, [value]);
-  const commit = () => { if (disabled) return; onCommit(parseNum(local)); setSaved(true); setTimeout(() => setSaved(false), 1200); };
+  const [local, setLocal] = useState(value ?? "");
+  const [saved, setSaved] = useState(false);
+  const [invalid, setInvalid] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const focused = useRef(false);
+  useEffect(() => { if (!focused.current) setLocal(value ?? ""); }, [value]);
+  const commit = async () => {
+    if (disabled || saving) return;
+    if (!isValidNumberInput(local)) { setInvalid(true); return; }
+    setInvalid(false);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const result = await onCommit(parseNum(local));
+      if (result !== null && result !== false) {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1200);
+      }
+    } finally { setSaving(false); }
+  };
   return (
     <label className="block text-center">
-      <span className="lbl flex items-center justify-center gap-0.5">{label}{saved && <Check size={9} className="gold" />}</span>
-      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onChange={(e) => setLocal(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
+      <span className="lbl flex items-center justify-center gap-0.5" style={invalid ? { color: "var(--late)" } : undefined}>{label}{saving ? " …" : saved ? <Check size={9} className="gold" /> : null}</span>
+      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onFocus={() => { focused.current = true; }} onChange={(e) => { setLocal(e.target.value); setInvalid(false); }} onBlur={() => { focused.current = false; void commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
     </label>
   );
 }
@@ -1198,18 +1218,6 @@ function StatusPill({ status }) {
   if (status === "submitted") return <span className="disp" style={{ color: "var(--early)", fontWeight: 600, fontSize: ".8rem" }}>● En attente JS</span>;
   return <span className="disp" style={{ color: "var(--draft)", fontWeight: 600, fontSize: ".8rem" }}>● Brouillon</span>;
 }
-function checkCell(cell, div) {
-  if (!div) return null;
-  const max = div.start || 10;
-  if (div.mode === "DE") {
-    if (cell.d == null) return "Note D manquante";
-    if (cell.d < 0) return "D négatif";
-    if (Object.values(cell.e || {}).some((v) => v < 0 || v > max)) return `E hors 0–${max}`;
-  } else if (Object.values(cell.notes || {}).some((v) => v < 0 || v > max)) return `Note hors 0–${max}`;
-  if ((cell.pen || 0) < 0 || (cell.pen || 0) > 5) return "Pénalité suspecte";
-  return null;
-}
-
 /* -------------------- Juge Supérieur (contrôle agrès) ------------- */
 function AgresControlView({ config, roster, scores, writeCell, discipline, apparatus, inquiries, live }) {
   const apLabel = apparatusOf(discipline).find((a) => a.id === apparatus)?.label;
@@ -1226,14 +1234,28 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
   const sorted = [...list].sort((a, b) => ((rank[scores?.[a.id]?.[apparatus]?.status] ?? 1) - (rank[scores?.[b.id]?.[apparatus]?.status] ?? 1)) || bibSort(a, b));
   const queueList = list.filter((g) => scores?.[g.id]?.[apparatus]?.status === "submitted");
   const queue = queueList.length;
-  const validateAllConform = () => { queueList.forEach((g) => { const c = scores?.[g.id]?.[apparatus] || {}; if (!(div && div.mode === "DE" && c.d == null)) writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) }); }); };
+  const conformList = queueList.filter((g) => !checkCell(scores?.[g.id]?.[apparatus], div));
+  const [validating, setValidating] = useState(false);
+  const validateAllConform = async () => {
+    if (config.frozen || validating) return;
+    setValidating(true);
+    try {
+      for (const g of conformList) {
+        const saved = await writeCell(g.id, apparatus, {
+          status: "validated", validatedAt: Date.now(),
+          tour: tourFor(config, discipline, g.group, apparatus)
+        });
+        if (saved === null) break;
+      }
+    } finally { setValidating(false); }
+  };
   return (
     <div className="space-y-4 risein">
       <div className="panel p-4 flex items-center justify-between flex-wrap gap-2">
         <div><div className="lbl">Juge Supérieur — {discipline}</div><div className="disp gold" style={{ fontSize: "1.8rem", fontWeight: 700, lineHeight: 1 }}>{apLabel}</div></div>
         <div className="flex items-center gap-3">
           <div className="text-right"><div className="lbl">À valider</div><div className="disp num" style={{ fontSize: "1.8rem", fontWeight: 700, color: queue ? "var(--early)" : "var(--dim)" }}>{queue}</div></div>
-          {queue > 0 && <button onClick={validateAllConform} className="btn btn-gold"><Check size={14} />Tout valider ({queue})</button>}
+          {conformList.length > 0 && <button onClick={validateAllConform} disabled={!!config.frozen || validating} className="btn btn-gold"><Check size={14} />Valider notes complètes ({conformList.length})</button>}
         </div>
       </div>
       <div className="panel p-4 grid sm:grid-cols-4 gap-3">
@@ -1246,7 +1268,7 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
         {sorted.length === 0 && <div className="p-6 text-center faint text-sm">Aucune gymnaste.</div>}
         {sorted.map((g) => {
           const cell = scores?.[g.id]?.[apparatus] || {}; const total = cellTotal(cell, div); const st = cell.status;
-          const dMissing = div && div.mode === "DE" && cell.d == null;
+          const scoreProblem = checkCell(cell, div);
           return (
             <div key={g.id} className="p-3 flex items-center gap-3 flex-wrap" style={{ borderTop: "1px solid var(--line)", background: st === "validated" ? "#3fae6a10" : st === "submitted" ? "#6aa2cc14" : "transparent" }}>
               <div className="flex-1 min-w-0">
@@ -1261,10 +1283,10 @@ function AgresControlView({ config, roster, scores, writeCell, discipline, appar
                 <div style={{ width: 62, textAlign: "right" }}><div className="lbl">Total</div><div className="disp num gold" style={{ fontWeight: 700, fontSize: "1.05rem" }}>{fmt(total)}</div></div>
               </div>
               <div className="flex items-center gap-2 justify-end" style={{ flexBasis: "100%" }}>
-                {dMissing && st !== "validated" && <span style={{ color: "var(--late)", fontSize: ".72rem" }}>Note D manquante — saisissez-la avant de valider</span>}
+                {scoreProblem && st !== "validated" && <span style={{ color: "var(--late)", fontSize: ".72rem" }}>{scoreProblem}</span>}
                 <StatusPill status={st} />
                 {st !== "validated"
-                  ? <button onClick={() => writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) })} disabled={total == null || dMissing || !!config.frozen} className="btn btn-gold"><Check size={14} />Valider (live)</button>
+                  ? <button onClick={() => writeCell(g.id, apparatus, { status: "validated", validatedAt: Date.now(), tour: tourFor(config, discipline, g.group, apparatus) })} disabled={total == null || !!scoreProblem || !!config.frozen} className="btn btn-gold"><Check size={14} />Valider (live)</button>
                   : <button onClick={() => writeCell(g.id, apparatus, { status: "submitted" })} className="btn" style={{ fontSize: ".75rem" }}>Rouvrir</button>}
                 {st === "submitted" && <button onClick={() => writeCell(g.id, apparatus, { status: "draft" })} className="btn" style={{ color: "var(--late)", fontSize: ".75rem" }}>Renvoyer au juge</button>}
               </div>
