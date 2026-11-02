@@ -256,7 +256,7 @@ input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.7);}
 
 /* ============================== APP ============================== */
 
-function SyncBanner({ status, error, retry }) {
+function SyncBanner({ status, error, retry, dismiss }) {
   if (status === "live" && !error) return null;
   const offline = status === "offline";
   return (
@@ -274,9 +274,14 @@ function SyncBanner({ status, error, retry }) {
             "Les résultats restent consultables ; actualisation automatique de secours.")}
         </div>
       </div>
-      <button type="button" onClick={retry} style={{ padding: "8px 12px", background: "#e0b961", border: 0, borderRadius: 8, fontWeight: 700, cursor: "pointer", color: "#181d28" }}>
-        Réessayer
-      </button>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button type="button" onClick={retry} style={{ padding: "8px 12px", background: "#e0b961", border: 0, borderRadius: 8, fontWeight: 700, cursor: "pointer", color: "#181d28" }}>
+          Actualiser
+        </button>
+        {error && <button type="button" onClick={dismiss} style={{ padding: "8px 10px", background: "transparent", border: "1px solid #9cabbc", color: "white", borderRadius: 8, cursor: "pointer" }}>
+          Alerte lue
+        </button>}
+      </div>
     </div>
   );
 }
@@ -294,6 +299,8 @@ export default function App() {
   const [staffOk, setStaffOk] = useState(false);
   const [syncStatus, setSyncStatus] = useState(navigator.onLine ? "connecting" : "offline");
   const [syncError, setSyncError] = useState("");
+  const failedSave = useRef(false);
+  const dismissError = () => { failedSave.current = false; setSyncError(""); };
   const [retryNonce, setRetryNonce] = useState(0);
   const tabToken = useRef("tab-" + (globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)));
 
@@ -330,7 +337,7 @@ export default function App() {
     const showError = (error) => {
       if (!active) return;
       console.error("Arena Grilles : connexion", error);
-      setSyncError(error?.message || "Connexion au serveur impossible.");
+      if (!failedSave.current) setSyncError(error?.message || "Connexion au serveur impossible.");
       setSyncStatus(navigator.onLine ? "fallback" : "offline");
     };
     const boot = async () => {
@@ -348,13 +355,13 @@ export default function App() {
         }
         if (active) {
           await refreshAll();
-          setSyncError("");
+          if (!failedSave.current) setSyncError("");
         }
       } catch (error) { showError(error); }
     };
     const resyncNow = () => {
       if (navigator.onLine) void refreshAll().then(() => {
-        if (active) setSyncError("");
+        if (active && !failedSave.current) setSyncError("");
       }).catch(showError);
     };
     const online = () => {
@@ -415,12 +422,13 @@ export default function App() {
     try {
       if (!navigator.onLine) throw new Error("Pas de connexion Internet : modification non enregistrée.");
       const value = await work();
-      setSyncError("");
+      if (!failedSave.current) setSyncError("");
       return value;
     } catch (error) {
       console.error("Arena Grilles : sauvegarde", error);
+      failedSave.current = true;
       setSyncError((error?.message || "Enregistrement impossible.") +
-        " Vérifiez la connexion et réessayez. Aucune sauvegarde n'est confirmée.");
+        " Opération non enregistrée : revérifiez la valeur et saisissez-la de nouveau. L’actualisation ne renvoie pas la modification.");
       setSyncStatus(navigator.onLine ? "fallback" : "offline");
       return null;
     }
@@ -484,7 +492,7 @@ export default function App() {
   const resync = useCallback(async () => {
     try {
       await refreshAll();
-      setSyncError("");
+      if (!failedSave.current) setSyncError("");
     } catch (error) { setSyncError(error?.message || "Synchronisation impossible."); }
   }, [refreshAll]);
 
@@ -496,7 +504,7 @@ export default function App() {
     {syncError && <p role="alert" style={{ marginTop: 14, color: "#ffbd89" }}>{syncError}</p>}
     <button className="btn btn-gold" style={{ marginTop: 16 }} onClick={() => setRetryNonce((n) => n + 1)}>Réessayer</button>
   </div>;
-  if (!session) return <><style>{STYLE}</style><SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} />{
+  if (!session) return <><style>{STYLE}</style><SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} dismiss={dismissError} />{
     !showGate ? <Landing config={config} roster={roster} scores={scores} live={live} lastSync={lastSync} onPublic={(mode) => setSession({ role: "public", mode })} onStaff={() => setShowGate(true)} />
       : !staffOk ? <StaffGate config={config} onOk={() => setStaffOk(true)} onBack={() => setShowGate(false)} />
         : <Gate config={config} onEnter={setSession} presence={presence} seatToken={tabToken.current} onBack={() => { setStaffOk(false); setShowGate(false); }} />
@@ -508,7 +516,7 @@ export default function App() {
   return (
     <div className="ff appbg grain" style={{ minHeight: "100vh" }}>
       <style>{STYLE}</style>
-      <SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} />
+      <SyncBanner status={syncStatus} error={syncError} retry={() => setRetryNonce((n) => n + 1)} dismiss={dismissError} />
       <header style={{ borderBottom: "1px solid var(--line)", position: "sticky", top: 0, zIndex: 20, backdropFilter: "blur(8px)", background: "#0a0b0dcc" }}>
         <div className="max-w-6xl mx-auto px-4 py-2.5 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1227,6 +1235,7 @@ function NumInput({ label, value, onCommit, w = 56, disabled }) {
   const [local, setLocal] = useState(value ?? "");
   const [saved, setSaved] = useState(false);
   const [invalid, setInvalid] = useState(false);
+  const [failed, setFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const focused = useRef(false);
   useEffect(() => { if (!focused.current) setLocal(value ?? ""); }, [value]);
@@ -1234,6 +1243,7 @@ function NumInput({ label, value, onCommit, w = 56, disabled }) {
     if (disabled || saving) return;
     if (!isValidNumberInput(local)) { setInvalid(true); return; }
     setInvalid(false);
+    setFailed(false);
     setSaved(false);
     setSaving(true);
     try {
@@ -1241,13 +1251,18 @@ function NumInput({ label, value, onCommit, w = 56, disabled }) {
       if (result !== null && result !== false) {
         setSaved(true);
         setTimeout(() => setSaved(false), 1200);
+      } else {
+        setFailed(true);
       }
+    } catch (error) {
+      console.error("Saisie non enregistrée", error);
+      setFailed(true);
     } finally { setSaving(false); }
   };
   return (
     <label className="block text-center">
-      <span className="lbl flex items-center justify-center gap-0.5" style={invalid ? { color: "var(--late)" } : undefined}>{label}{saving ? " …" : saved ? <Check size={9} className="gold" /> : null}</span>
-      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onFocus={() => { focused.current = true; }} onChange={(e) => { setLocal(e.target.value); setInvalid(false); }} onBlur={() => { focused.current = false; void commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
+      <span className="lbl flex items-center justify-center gap-0.5" style={invalid || failed ? { color: "var(--late)" } : undefined}>{label}{saving ? " …" : failed ? " · NON SAUVÉ" : saved ? <Check size={9} className="gold" /> : null}</span>
+      <input inputMode="decimal" disabled={disabled} className="inp num text-center" style={{ width: w, padding: ".55rem .3rem", fontSize: "1.1rem", fontWeight: 700, opacity: disabled ? .45 : 1, cursor: disabled ? "not-allowed" : "text" }} value={local} onFocus={() => { focused.current = true; }} onChange={(e) => { setLocal(e.target.value); setInvalid(false); setFailed(false); }} onBlur={() => { focused.current = false; void commit(); }} onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} placeholder="—" />
     </label>
   );
 }
