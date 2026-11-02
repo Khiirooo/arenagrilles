@@ -37,6 +37,9 @@ begin
     or (p_key = 'ffg10:presence' and p_action in ('presence_beat', 'presence_claim', 'presence_release'))
     or (p_key = 'ffg10:log' and p_action = 'log_add')
     or (p_key = 'ffg10:chat' and p_action = 'chat_add')
+    or (p_key = 'ffg10:config' and p_action = 'config_cas')
+    or (p_key = 'ffg10:live' and p_action = 'live_cas')
+    or (p_key = 'ffg10:roster' and p_action = 'roster_replace_cas')
   ) then
     raise exception 'Mutation non autorisée : % / %', p_key, p_action using errcode = '22023';
   end if;
@@ -54,7 +57,22 @@ begin
   v_id := nullif(p_payload->>'id', '');
   v_patch := p_payload->'patch';
 
-  if p_action = 'scores_reset' then
+  if p_action in ('config_cas', 'live_cas', 'roster_replace_cas') then
+    -- Compare-and-swap : empêche une vieille fenêtre d'écraser les modifications
+    -- plus récentes d'un autre organisateur.
+    if v is distinct from p_payload->'expected' then
+      raise exception 'Ces données ont été modifiées sur un autre appareil. Actualisez puis réessayez.'
+        using errcode = '40001';
+    end if;
+    if (p_action = 'roster_replace_cas'
+        and jsonb_typeof(p_payload->'value') <> 'array')
+      or (p_action <> 'roster_replace_cas'
+        and jsonb_typeof(p_payload->'value') <> 'object') then
+      raise exception 'Format de remplacement invalide' using errcode = '22023';
+    end if;
+    v := p_payload->'value';
+
+  elsif p_action = 'scores_reset' then
     -- Sauvegarde avant effacement, dans la même transaction.
     v_backup := 'ffg10:backup:' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISSMS') ||
                 ':' || substr(md5(random()::text), 1, 8);
