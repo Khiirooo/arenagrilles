@@ -20,6 +20,8 @@ declare
   v_id text;
   v_ap text;
   v_token text;
+  v_slot text;
+  v_occupied boolean;
   v_now bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
 begin
   if p_payload is null or jsonb_typeof(p_payload) <> 'object' then
@@ -30,7 +32,7 @@ begin
     (p_key = 'ffg10:scores' and p_action in ('score_patch', 'score_delete'))
     or (p_key = 'ffg10:roster' and p_action in ('roster_add', 'roster_edit', 'roster_delete'))
     or (p_key = 'ffg10:inquiries' and p_action in ('inquiry_add', 'inquiry_edit'))
-    or (p_key = 'ffg10:presence' and p_action = 'presence_beat')
+    or (p_key = 'ffg10:presence' and p_action in ('presence_beat', 'presence_claim', 'presence_release'))
   ) then
     raise exception 'Mutation non autorisée : % / %', p_key, p_action using errcode = '22023';
   end if;
@@ -111,17 +113,93 @@ begin
       from jsonb_array_elements(v) with ordinality as x(item, ord);
     end if;
 
-  elsif p_action = 'presence_beat' then
+  elsif p_action in ('presence_beat', 'presence_claim', 'presence_release') then
     v_token := nullif(p_payload->>'token', '');
     v_item := p_payload->'entry';
-    if v_token is null or length(v_token) > 160 or jsonb_typeof(v_item) <> 'object'
-       then raise exception 'Présence invalide'; end if;
+    v_slot := nullif(p_payload->>'slot', '');
+    if v_token is null or length(v_token) > 160 then
+      raise exception 'Identifiant de présence invalide' using errcode = '22023';
+    end if;
     if jsonb_typeof(v) <> 'object' then v := '{}'::jsonb; end if;
+
+    -- Supprimer les sessions expirées sous verrou.
     select coalesce(jsonb_object_agg(x.k, x.item), '{}'::jsonb) into v
     from jsonb_each(v) as x(k, item)
-    where case when coalesce(x.item->>'ts', '') ~ '^[0-9]+$'
-      then (x.item->>'ts')::numeric > v_now - 60000 else false end;
-    v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    where case when coalesce(x.item->>'ts', '') ~ '^[0-9]+
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+      then (x.item->>'ts')::numeric > v_now - 45000 else false end;
+
+    if p_action = 'presence_release' then
+      v := v - v_token;
+    elsif p_action = 'presence_claim' then
+      if v_slot is null
+        or v_slot !~ '^juge:(GAF|GAM):[a-z0-9_-]+:(JS|[1-9][0-9]*)
+
+  update public.kv set value = v, updated_at = now() where key = p_key;
+  return v;
+end
+$arena$;
+
+revoke all on function public.arena_apply_mutation(text, text, jsonb) from public;
+-- Compatibilité avec le fonctionnement existant : les autorisations de kv
+-- continuent de s'appliquer, car la fonction est SECURITY INVOKER.
+grant execute on function public.arena_apply_mutation(text, text, jsonb)
+  to anon, authenticated;
+
+-- Realtime : notifier les autres appareils dès la validation de la note.
+do $arena$
+begin
+  alter publication supabase_realtime add table public.kv;
+exception
+  when duplicate_object then null;
+end
+$arena$;
+
+        or left(v_token, length(v_slot) + 1) <> v_slot || ':'
+        or jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Poste de juge invalide' using errcode = '22023';
+      end if;
+      select exists (
+        select 1 from jsonb_each(v) as x(k, item)
+        where left(x.k, length(v_slot) + 1) = v_slot || ':'
+        and x.k <> v_token
+      ) into v_occupied;
+      if v_occupied then
+        raise exception 'Ce poste est déjà occupé par un autre appareil. Réessayez dans 45 s si la session précédente est fermée.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    else
+      if jsonb_typeof(v_item) <> 'object' then
+        raise exception 'Présence invalide' using errcode = '22023';
+      end if;
+      -- Un juge ne peut pas récupérer un poste dont il a perdu la réservation.
+      if left(v_token, 5) = 'juge:' and not (v ? v_token) then
+        raise exception 'Réservation du poste de juge expirée : reconnectez-vous.'
+          using errcode = 'P0001';
+      end if;
+      v := v || jsonb_build_object(v_token, v_item || jsonb_build_object('ts', v_now));
+    end if;
   end if;
 
   update public.kv set value = v, updated_at = now() where key = p_key;
